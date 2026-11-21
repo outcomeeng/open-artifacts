@@ -154,6 +154,10 @@ export async function tool(
 export const textOf = (r: ToolResult) =>
   r.content.map((c) => c.text ?? "").join("\n");
 
+/** The one-line summary that opens a result's text, before the serialized result. */
+export const summaryOf = (r: ToolResult) =>
+  (r.content[0]?.text ?? "").split("\n\n")[0] ?? "";
+
 /** A fresh client IP per registration, so tests never share one RL_ANON key. */
 let ipSeq = 0;
 export const nextIp = () => {

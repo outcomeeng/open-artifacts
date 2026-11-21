@@ -7,7 +7,13 @@ import { createPat } from "../src/auth/pat.js";
 import { getDb } from "../src/db/client.js";
 import { shares } from "../src/db/schema.js";
 import { api, login } from "./helpers.js";
-import { connect, type ToolResult, textOf, tool } from "./mcp-helpers.js";
+import {
+  connect,
+  summaryOf,
+  type ToolResult,
+  textOf,
+  tool,
+} from "./mcp-helpers.js";
 
 // #681 D: publish_artifact with an id and only settings updates them in
 // place through the PATCH service path and creates no version.
@@ -103,9 +109,9 @@ describe("publish_artifact with only settings (#681 D)", () => {
       title: `so ${tag}`,
     });
     expect(r.content).toHaveLength(1);
-    expect(textOf(r)).not.toContain("\n");
-    expect(textOf(r)).toContain(first.url);
-    expect(textOf(r)).toMatch(/no new version/);
+    expect(summaryOf(r)).not.toContain("\n");
+    expect(summaryOf(r)).toContain(first.url);
+    expect(summaryOf(r)).toMatch(/no new version/);
     expect(await versions(id)).toBe(1);
     const a = await summary(id);
     expect(a).toMatchObject({
