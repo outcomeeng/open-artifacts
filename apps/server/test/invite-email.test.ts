@@ -19,7 +19,7 @@ import {
 import { publish } from "../src/services/artifacts.js";
 import { getUser } from "../src/services/users.js";
 import { login } from "./helpers.js";
-import { connect, E, textOf, tool } from "./mcp-helpers.js";
+import { connect, E, summaryOf, textOf, tool } from "./mcp-helpers.js";
 import { pinMiddayUtc } from "./midday.js";
 
 const app = createApp();
@@ -344,7 +344,7 @@ describe("share email", () => {
       role: "editor",
     });
     const url = `http://app.localhost/a/${id}`;
-    expect(textOf(r)).toBe(
+    expect(summaryOf(r)).toBe(
       `Shared ${id} with ${email}. They're a guest, so they can view and comment. ${url}. No email sent.`,
     );
     expect(r.structuredContent).toMatchObject({
@@ -353,7 +353,7 @@ describe("share email", () => {
     });
     const viewer = fresh();
     expect(
-      textOf(
+      summaryOf(
         await tool(client, "share_artifact", {
           id,
           email: viewer,
@@ -370,7 +370,7 @@ describe("share email", () => {
       email: memberEmail,
       role: "editor",
     });
-    expect(textOf(r2)).toContain(`with ${memberEmail} as editor`);
+    expect(summaryOf(r2)).toContain(`with ${memberEmail} as editor`);
     expect(r2.structuredContent).not.toHaveProperty("guest");
     await client.close();
   });
