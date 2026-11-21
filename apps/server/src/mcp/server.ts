@@ -60,13 +60,25 @@ export type ToolEnv = McpContext & {
   agentNow: () => AgentAttr | null;
 };
 
-/** `{ content: [one-line summary], structuredContent }`. */
+/**
+ * `{ content: [one-line summary, then the serialized result], structuredContent }`.
+ *
+ * The text block also carries `structuredContent` as JSON, as the MCP spec
+ * recommends for backwards compatibility: clients that hand the model only
+ * `content` (Antigravity, Gemini CLI) otherwise see the summary alone.
+ */
 export function ok(
   text: string,
   structuredContent: Record<string, unknown>,
 ): CallToolResult {
+  const summary = text.replace(/\s*\n\s*/g, " ");
   return {
-    content: [{ type: "text", text: text.replace(/\s*\n\s*/g, " ") }],
+    content: [
+      {
+        type: "text",
+        text: `${summary}\n\n${JSON.stringify(structuredContent)}`,
+      },
+    ],
     structuredContent,
   };
 }

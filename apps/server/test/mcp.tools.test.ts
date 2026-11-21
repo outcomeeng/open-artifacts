@@ -31,6 +31,7 @@ import {
   connect,
   E,
   MCP_URL,
+  summaryOf,
   type ToolResult,
   textOf,
   tool,
@@ -153,8 +154,11 @@ describe("MCP tools over PAT", () => {
     const pub = sc<{ url: string }>(r);
     expect(r.content).toHaveLength(1);
     expect(r.content[0]?.type).toBe("text");
-    expect(textOf(r)).not.toContain("\n");
-    expect(textOf(r)).toContain(pub.url);
+    expect(summaryOf(r)).not.toContain("\n");
+    expect(summaryOf(r)).toContain(pub.url);
+    expect(JSON.parse(textOf(r).slice(summaryOf(r).length + 2))).toEqual(
+      r.structuredContent,
+    );
   });
 
   it("a 3-file HTML artifact → list_versions has 1 version with 3 files", async () => {
