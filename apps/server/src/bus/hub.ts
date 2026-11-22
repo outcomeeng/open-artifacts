@@ -8839,12 +8839,14 @@ export class BusHub extends DurableObject<Env> {
       ),
       min("select min(expires_at) as t from receipts where state = 'pending'"),
       min("select min(expires_at) as t from mail"),
+      // The newest receipt is never purged (B11 L1), so it sets no deadline:
+      // counting it re-armed the alarm at now + 1 forever on a quiet hub.
       min(
-        "select min(notified_at) as t from receipts where notified_at is not null",
+        "select min(notified_at) as t from receipts where notified_at is not null and rowid < (select max(rowid) from receipts)",
         RETAIN_MS,
       ),
       min(
-        "select min(final_at) as t from receipts where notified_at is null and state != 'pending'",
+        "select min(final_at) as t from receipts where notified_at is null and state != 'pending' and rowid < (select max(rowid) from receipts)",
         RETAIN_MS,
       ),
       min(
