@@ -48,10 +48,12 @@ export type UpdateState = {
 
 /**
  * The server's own genuine release: its built-in VERSION when that is a strict
- * x.y.z (a -dev or pre-release build, or one with build metadata, has none).
+ * x.y.z (a pre-release build has none). outcomeeng: a release tag with our
+ * patches reports <x.y.z>-dev+<sha> and runs that release, so it counts as it.
  */
 export function releaseOf(serverVersion: string): string | null {
-  const ok = RunVersionSchema.safeParse(serverVersion);
+  const base = /^(\d+\.\d+\.\d+)-dev\+[0-9a-f]+$/.exec(serverVersion)?.[1];
+  const ok = RunVersionSchema.safeParse(base ?? serverVersion);
   return ok.success ? ok.data : null;
 }
 

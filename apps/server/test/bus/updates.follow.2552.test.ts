@@ -173,15 +173,16 @@ describe("following the instance (#2552)", () => {
     });
   });
 
-  it("a -dev or pre-release VERSION gives no default and records nothing", async () => {
-    for (const v of ["1.2.0-dev+abc1234", "1.2.0-rc.1"]) {
-      const { target } = await open(v, "1.0.0");
-      expect(target).toBeNull();
-    }
+  it("a pre-release VERSION gives no default and records nothing", async () => {
+    const { target } = await open("1.2.0-rc.1", "1.0.0");
+    expect(target).toBeNull();
     expect(await getKey(VERSION_SINCE_KEY)).toBeNull();
+  });
+
+  it("outcomeeng: a patched release (-dev+sha) counts as its release", async () => {
     await since("1.2.0", NOW - 2 * SOAK_MS);
     const dev = await open("1.2.0-dev+abc1234", "1.0.0");
-    expect(dev.target).toBeNull();
+    expect(dev.target).toBe("1.2.0");
   });
 
   it("a server older than the machine leaves the machine alone", async () => {
@@ -229,10 +230,10 @@ describe("update_ack with the default (#2552)", () => {
     expect(await ackOf(d, sw({ from: "1.0.0", to: "1.2.0" }))).toBe(false);
   });
 
-  it("a -dev server: refused", async () => {
+  it("outcomeeng: a patched release (-dev+sha) server: allowed like its release", async () => {
     await since("1.2.0", NOW - 2 * SOAK_MS);
     const { d } = await open("1.2.0-dev+abc1234", "1.0.0");
-    expect(await ackOf(d, sw({ from: "1.0.0", to: "1.2.0" }))).toBe(false);
+    expect(await ackOf(d, sw({ from: "1.0.0", to: "1.2.0" }))).toBe(true);
   });
 });
 
