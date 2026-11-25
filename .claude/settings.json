@@ -26,5 +26,16 @@
       "Bash(gh pr comment *-R*)",
       "Bash(gh pr comment *://*)"
     ]
+  },
+  "extraKnownMarketplaces": {
+    "outcomeeng": {
+      "source": {
+        "source": "github",
+        "repo": "outcomeeng/plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "product-tree@outcomeeng": true
   }
 }
