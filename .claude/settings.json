@@ -36,6 +36,7 @@
     }
   },
   "enabledPlugins": {
-    "product-tree@outcomeeng": true
+    "product-tree@outcomeeng": true,
+    "contribute@outcomeeng": true
   }
 }
