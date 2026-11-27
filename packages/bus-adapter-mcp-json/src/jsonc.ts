@@ -222,7 +222,19 @@ export function setJsoncValue(
 
 /** Removes the member at `path`: the inverse of `setJsoncValue` for a member it added. */
 export function removeJsoncValue(text: string, path: JSONPath): string {
-  return verified(removeAt(text, path), path, undefined);
+  const index = path.at(-1);
+  const parent = path.slice(0, -1);
+  const before =
+    typeof index === "number" ? jsoncValue(text, parent) : undefined;
+  const out = removeAt(text, path);
+  // Removing an array element shifts its successors into the same index.
+  if (Array.isArray(before))
+    return verified(
+      out,
+      parent,
+      before.filter((_, i) => i !== index),
+    );
+  return verified(out, path, undefined);
 }
 
 /** The value at `path`, or undefined; the text must parse. */
@@ -336,4 +348,142 @@ export function removePlugin(text: string, pluginPath: string): string {
     ["plugins"],
     list.filter((e) => !names(e, pluginPath)),
   );
+}
+
+/** agy loads an mcp_config.json saved with a UTF-8 byte-order mark; the edit keeps it. */
+const BOM = "﻿";
+function withoutBom(text: string, edit: (body: string) => string): string {
+  if (!text.startsWith(BOM)) return edit(text);
+  return BOM + edit(text.slice(BOM.length));
+}
+
+/** The text of an Antigravity mcp_config.json, parsed (a byte-order mark allowed). */
+export function parseAgyMcp(text: string, where: string): Doc {
+  return parseJsonc(text.startsWith(BOM) ? text.slice(1) : text, where);
+}
+
+export type AgyServer = { command: string; args: string[] };
+
+/**
+ * Antigravity (agy): `mcpServers.<name>`, a stdio entry of command, args and
+ * env. Ours sets `command`, `args`, and `env.OA_BUS_HOME` only when `home` is
+ * given. Any other key of the entry (`disabled`, `enabledTools`, other env) is
+ * the user's and stays, so a server they turned off stays off.
+ */
+export function upsertAgyMcp(
+  text: string,
+  name: string,
+  server: AgyServer,
+  home?: string,
+): string {
+  return withoutBom(text, (body) => {
+    const doc = parseJsonc(body, "mcp_config.json");
+    const servers = record(doc.mcpServers, "mcpServers");
+    const at = ["mcpServers", name];
+    const entry = record(servers?.[name], `mcpServers.${name}`);
+    if (entry === undefined) {
+      const want = {
+        ...server,
+        ...(home === undefined ? {} : { env: { OA_BUS_HOME: home } }),
+      };
+      return verified(insert(body, at, want), at, want);
+    }
+    let out = body;
+    // An http entry under our name is not one agy would run as ours.
+    for (const k of ["url", "serverUrl"])
+      if (entry[k] !== undefined) out = removeAt(out, [...at, k]);
+    if (!same(entry.command, server.command))
+      out = insert(out, [...at, "command"], server.command);
+    if (!same(entry.args, server.args))
+      out = insert(out, [...at, "args"], server.args);
+    const env = record(entry.env, `mcpServers.${name}.env`);
+    if (home !== undefined && env?.OA_BUS_HOME !== home)
+      out = insert(out, [...at, "env", "OA_BUS_HOME"], home);
+    if (home === undefined && env?.OA_BUS_HOME !== undefined) {
+      out = removeAt(out, [...at, "env", "OA_BUS_HOME"]);
+      out = removeIfEmpty(out, [...at, "env"]);
+    }
+    verified(out, [...at, "command"], server.command);
+    verified(out, [...at, "env", "OA_BUS_HOME"], home);
+    return verified(out, [...at, "args"], server.args);
+  });
+}
+
+/** Adds a fresh named server, retaining agy's BOM and the surrounding JSONC. */
+export function insertAgyEntry(text: string, name: string, entry: Doc): string {
+  return withoutBom(text, (body) => {
+    const servers = record(
+      parseJsonc(body, "mcp_config.json").mcpServers,
+      "mcpServers",
+    );
+    if (servers && Object.hasOwn(servers, name))
+      throw new Error(`mcp_config.json already has a ${name} entry`);
+    return setJsoncValue(body, ["mcpServers", name], entry);
+  });
+}
+
+/** Removes `mcpServers.<name>` and nothing else; unchanged when it is not there. */
+export function removeAgyMcp(text: string, name: string): string {
+  return withoutBom(text, (body) => {
+    const servers = record(
+      parseJsonc(body, "mcp_config.json").mcpServers,
+      "mcpServers",
+    );
+    if (servers?.[name] === undefined) return body;
+    return verified(
+      removeAt(body, ["mcpServers", name]),
+      ["mcpServers", name],
+      undefined,
+    );
+  });
+}
+
+/** removeIfEmpty for an Antigravity config: a byte-order mark allowed. */
+export function removeAgyIfEmpty(text: string, path: JSONPath): string {
+  return withoutBom(text, (body) => removeIfEmpty(body, path));
+}
+
+/**
+ * agy S5: the source text of `mcpServers.<name>`'s value, as it is in the
+ * file (a byte-order mark allowed); undefined when there is no such entry.
+ */
+export function agyEntryText(text: string, name: string): string | undefined {
+  return agyEntryAt(text, name)?.raw;
+}
+
+/** agyEntryText, and the leading whitespace of the line the value starts on. */
+export function agyEntryAt(
+  text: string,
+  name: string,
+): { raw: string; indent: string; eol: string } | undefined {
+  const body = text.startsWith(BOM) ? text.slice(BOM.length) : text;
+  const root = parseTree(body);
+  const node = root && findNodeAtLocation(root, ["mcpServers", name]);
+  if (node === undefined) return undefined;
+  return {
+    raw: body.slice(node.offset, node.offset + node.length),
+    indent: lineAt(body, member(node).offset).indent,
+    eol: eol(body),
+  };
+}
+
+/**
+ * agy S5: replaces the value of `mcpServers.<name>` with `raw`, source text
+ * that must parse to `want`. Nothing else in the file moves, so writing the
+ * old text back gives the file as it was, byte for byte.
+ */
+export function setAgyEntryText(
+  text: string,
+  name: string,
+  raw: string,
+  want: unknown,
+): string {
+  return withoutBom(text, (body) => {
+    const root = parseTree(body);
+    const node = root && findNodeAtLocation(root, ["mcpServers", name]);
+    if (node === undefined)
+      throw new Error(`mcp_config.json has no ${name} entry`);
+    const out = splice(body, node.offset, node.offset + node.length, raw);
+    return verified(out, ["mcpServers", name], want);
+  });
 }

@@ -1,4 +1,4 @@
-import type { Me } from "@oa/shared";
+import { type Me, PersonHandleSchema, suggestedHandle } from "@oa/shared";
 import {
   Button,
   Dialog,
@@ -10,7 +10,7 @@ import {
   Input,
   Label,
 } from "@oa/ui/shadcn";
-import { useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { useUpdateMe } from "../api/queries";
 import { useSingleFlight } from "../api/useSingleFlight";
 import {
@@ -20,10 +20,15 @@ import {
   saveError,
   TOO_LONG,
 } from "../auth/displayName";
+import { HandleField } from "../auth/HandleField";
 
 /** "Not now" lasts for this browser session, per user. */
 const skipKey = (userId: string) => `oa:display-name-skipped:${userId}`;
+/** Skipped in this page load, for when storage is blocked. */
+const skippedNow = new Set<string>();
+const listeners = new Set<() => void>();
 const skipped = (userId: string) => {
+  if (skippedNow.has(userId)) return true;
   try {
     return sessionStorage.getItem(skipKey(userId)) === "1";
   } catch {
@@ -35,8 +40,29 @@ const remember = (userId: string) => {
     sessionStorage.setItem(skipKey(userId), "1");
   } catch {
     // Storage blocked: the dialog just comes back on the next load.
+    skippedNow.add(userId);
   }
+  for (const l of listeners) l();
 };
+const subscribe = (l: () => void) => {
+  listeners.add(l);
+  return () => {
+    listeners.delete(l);
+  };
+};
+
+/**
+ * #3130: whether the name prompt is up for this user (the server asks for a
+ * name and they haven't said "Not now"). The Welcome redirect waits on it:
+ * the viewer has no app shell, so the prompt would vanish under it.
+ */
+export function useNamePromptOpen(me: Me | undefined): boolean {
+  const userId = me?.user.id;
+  const skip = useSyncExternalStore(subscribe, () =>
+    userId ? skipped(userId) : false,
+  );
+  return Boolean(me?.needsDisplayName) && !skip;
+}
 
 /** Asks for a display name while the server says the user needs one. Key it by user id. */
 export function DisplayNamePrompt({ me }: { me: Me }) {
@@ -48,6 +74,9 @@ export function DisplayNamePrompt({ me }: { me: Me }) {
   const once = useSingleFlight();
   const open = me.needsDisplayName && !dismissed;
   const trimmed = name.trim();
+  const [handleDraft, setHandleDraft] = useState<string | null>(null);
+  const handle = handleDraft ?? me.handle ?? suggestedHandle(name);
+  const valid = nameOk(trimmed) && PersonHandleSchema.safeParse(handle).success;
   const tooLong = nameLength(trimmed) > NAME_MAX;
   const notNow = () => {
     remember(userId);
@@ -76,11 +105,11 @@ export function DisplayNamePrompt({ me }: { me: Me }) {
           className="grid gap-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (!nameOk(trimmed) || update.isPending) return;
+            if (!valid || update.isPending) return;
             setError(null);
             once((done) =>
               update.mutate(
-                { displayName: trimmed },
+                { displayName: trimmed, handle },
                 { onError: (err) => setError(saveError(err)), onSettled: done },
               ),
             );
@@ -118,14 +147,16 @@ export function DisplayNamePrompt({ me }: { me: Me }) {
               </p>
             )}
           </div>
+          <HandleField
+            value={handle}
+            saved={me.handle}
+            onChange={setHandleDraft}
+          />
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={notNow}>
               Not now
             </Button>
-            <Button
-              type="submit"
-              disabled={!nameOk(trimmed) || update.isPending}
-            >
+            <Button type="submit" disabled={!valid || update.isPending}>
               Save
             </Button>
           </DialogFooter>

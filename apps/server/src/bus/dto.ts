@@ -1,5 +1,6 @@
 import { type BusAgent, BusAgentSchema } from "@oa/shared";
 import { logWarn } from "../log.js";
+import { productOf } from "../services/agent-display.js";
 import { isDefaultAgentName } from "./default-names.js";
 import type { AgentRow } from "./rows.js";
 import { statusFields } from "./status.js";
@@ -28,6 +29,14 @@ export type AgentWithMachine = Omit<AgentRow, "sessionStartRowid"> & {
   minted?: number;
   /** #2311: a role names this agent. */
   roleHolder?: number;
+  /** #3132: the role it holds in its own namespace, by name. */
+  roleName?: string | null;
+  roleId?: string | null;
+  /** #3132: it handed a role on and holds none now. */
+  handedOver?: number;
+  /** #3132: the role it asked to take over, while that ask is pending. */
+  privateSessionName?: number | null;
+  pendingRole?: string | null;
 };
 
 /**
@@ -35,33 +44,40 @@ export type AgentWithMachine = Omit<AgentRow, "sessionStartRowid"> & {
  * (BusAgentSchema). `connected`: its machine holds a daemon socket (live),
  * else queued. Callers omit closed agents and agents of revoked machines.
  */
-export const agentDto = (
-  a: AgentWithMachine,
-  connected: boolean,
-): BusAgent => ({
-  id: a.id,
-  namespace: a.namespace,
-  name: a.name,
-  kind: a.kind,
-  machineId: a.machineId,
-  machineLabel: a.machineLabel,
-  global: a.global === 1,
-  // #1295: a closed agent whose mailbox is kept is away, not running.
-  state: a.live === 1 ? (connected ? "live" : "queued") : "away",
-  running: a.live === 1,
-  since:
-    a.live !== 1 && a.awaySince !== undefined && a.awaySince !== null
-      ? iso(a.awaySince)
-      : null,
-  updatedAt: iso(a.updatedAt),
-  // #2311: still on a harness default name (never renamed by a user or session).
-  ...(a.nameChosen === 0 &&
-  a.roleHolder === 0 &&
-  isDefaultAgentName(a.name, a.kind, a.minted === 1)
-    ? { unnamed: true }
-    : {}),
-  ...statusFields(a),
-});
+export const agentDto = (a: AgentWithMachine, connected: boolean): BusAgent => {
+  const product = productOf(a.kind);
+  return {
+    id: a.id,
+    namespace: a.namespace,
+    name: a.name,
+    kind: a.kind,
+    // The app the kind runs, for the Agents page; absent for a kind the server doesn't know.
+    ...(product ? { product } : {}),
+    machineId: a.machineId,
+    machineLabel: a.machineLabel,
+    global: a.global === 1,
+    // #1295: a closed agent whose mailbox is kept is away, not running.
+    state: a.live === 1 ? (connected ? "live" : "queued") : "away",
+    running: a.live === 1,
+    since:
+      a.live !== 1 && a.awaySince !== undefined && a.awaySince !== null
+        ? iso(a.awaySince)
+        : null,
+    updatedAt: iso(a.updatedAt),
+    // #2311: still on a harness default name (never renamed by a user or session).
+    ...(a.nameChosen === 0 &&
+    a.roleHolder === 0 &&
+    isDefaultAgentName(a.name, a.kind, a.minted === 1)
+      ? { unnamed: true }
+      : {}),
+    ...statusFields(a),
+    ...(a.roleName ? { role: a.roleName } : {}),
+    ...(a.roleId ? { roleId: a.roleId } : {}),
+    ...(a.handedOver === 1 ? { handedOver: true } : {}),
+    ...(a.privateSessionName === 1 ? { privateSessionName: true } : {}),
+    ...(a.pendingRole ? { pendingRole: a.pendingRole } : {}),
+  };
+};
 
 /** The DTOs that parse with BusAgentSchema; the rest are skipped (one log line, no contents). */
 export function validAgents(dtos: BusAgent[]): BusAgent[] {

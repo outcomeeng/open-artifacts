@@ -1,5 +1,5 @@
 import { type CommentAuthor, PRESENCE_PALETTE_SIZE } from "@oa/shared";
-import { render } from "@testing-library/react";
+import { render, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { AuthorFace, AuthorSub } from "../src/viewer/comments/AuthorFace";
 
@@ -90,5 +90,86 @@ describe("#1822 author face", () => {
     expect(c.querySelector(".sr-only")?.textContent).toBe("linked, ");
     expect(c.textContent).toContain("for Leo Urbina");
     expect(face(unlinked).querySelector(".sr-only")).toBeNull();
+  });
+
+  it("a linked agent's app shows its mark beside the product, for every kind (agy S6)", () => {
+    for (const [product, tag] of [
+      ["Claude Code", "IMG"],
+      ["Codex", "SPAN"],
+      ["Antigravity", "SPAN"],
+      ["oh-my-pi", "SPAN"],
+      ["pi", "IMG"],
+      ["Hermes", "IMG"],
+    ] as const) {
+      const c = face({ ...linked, product });
+      const line = c.querySelector("[data-for]") as HTMLElement;
+      const mark = within(line).getByRole("img", { name: product });
+      expect(mark.tagName, product).toBe(tag);
+      // The name is read once: from the mark, not again from the word.
+      expect(line.textContent).toBe(`linked, ${product} · for Leo Urbina`);
+      expect(within(line).getByText(product)).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+    }
+  });
+  it("a kind the server has no product for: its token with a first-letter tile (agy S6)", () => {
+    const c = face({ ...linked, product: undefined, appKind: "kiro" });
+    const line = c.querySelector("[data-for]") as HTMLElement;
+    expect(line.textContent).toBe("linked, kiro · for Leo Urbina");
+    const mark = within(line).getByRole("img", { name: "kiro" });
+    expect(mark.style.maskImage).toContain(encodeURIComponent(">K</text>"));
+  });
+  it("no mark for an unlinked agent, or a linked one with no app (agy S6)", () => {
+    expect(face(unlinked).querySelector('[role="img"], img')).toBeNull();
+    const c = face({ ...linked, product: undefined });
+    expect(c.querySelector("[data-for]")?.textContent).toBe(
+      "linked, for Leo Urbina",
+    );
+    expect(c.querySelector("[data-for] [role=img], [data-for] img")).toBeNull();
+  });
+});
+
+describe("#3132 an agent shown as its role", () => {
+  it("names the role; the session and who holds the role now are small print", () => {
+    const c = face({
+      ...linked,
+      name: "OA Platform",
+      session: "OA Platform L",
+      role: { name: "OA Platform", machine: "laptop" },
+    });
+    expect(c.querySelector("[data-role-session]")?.textContent).toBe(
+      "on the laptop · ",
+    );
+    const moved = face({
+      ...linked,
+      name: "OA Platform",
+      session: "OA Platform L",
+      role: {
+        name: "OA Platform",
+        machine: "laptop",
+        holder: "OA Platform W",
+        holderMachine: "workstation",
+      },
+    });
+    expect(moved.querySelector("[data-role-session]")?.textContent).toBe(
+      "was on the laptop, now on the workstation · ",
+    );
+    expect(moved.textContent).toContain("for Leo Urbina");
+  });
+
+  it("falls back to the app when no machine label is available", () => {
+    const c = face({
+      ...linked,
+      session: "OA Platform L",
+      role: { name: "OA Platform" },
+    });
+    expect(c.querySelector("[data-role-session]")?.textContent).toBe(
+      "on Claude Code · ",
+    );
+  });
+
+  it("an agent with no role shows no session line", () => {
+    expect(face(linked).querySelector("[data-role-session]")).toBeNull();
   });
 });

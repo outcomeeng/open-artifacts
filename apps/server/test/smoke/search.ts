@@ -3,8 +3,12 @@ import {
   PublishResultSchema,
   R,
   SearchHitSchema,
+  VersionInfoSchema,
 } from "@oa/shared";
 import { afterAll, describe, expect, it } from "vitest";
+import { z } from "zod";
+import { buffered } from "../xt/settled-otp.js";
+import { findIndexed } from "./search-settle.js";
 
 const base = process.env.STAGING_URL;
 const pat = process.env.STAGING_OWNER_PAT;
@@ -44,37 +48,39 @@ describe.skipIf(!base || !pat)("staging smoke: search", () => {
     expect(r.status).toBe(201);
     const { id } = PublishResultSchema.parse(await r.json());
     created.push(id);
-    // C3: the body is indexed asynchronously by the artifact DO's alarm.
-    let found = false;
-    let last = "";
-    const deadline = Date.now() + 60_000;
-    for (;;) {
-      // A transient non-200 or a timed-out poll is "not yet" until the
-      // deadline; a 401/403 (the PAT itself refused) fails at once.
-      let status = 0;
-      try {
-        const s = await fetch(`${base}${R.search}?q=${word}`, {
-          headers: { authorization: `Bearer ${pat}` },
-          signal: AbortSignal.timeout(10_000),
+    // C3: the body is indexed asynchronously by the artifact DO's alarm. The
+    // versions read holds while that job is pending (R.versions wait) and
+    // answers when it settles: held asks, then one search, all inside one 60 s
+    // budget (search-settle.ts); a PAT that is refused fails at once.
+    const auth = { authorization: `Bearer ${pat}` };
+    await findIndexed({
+      versions: async (wait, signal) => {
+        const r = await fetch(`${base}${R.versions(id, undefined, wait)}`, {
+          headers: auth,
+          signal,
         });
-        status = s.status;
-        last = `${s.status} ${await s.text()}`;
-      } catch (e) {
-        last = `error ${(e as Error).name}`;
-      }
-      expect([401, 403], last).not.toContain(status);
-      if (status === 200) {
-        const page = PageSchema(SearchHitSchema).parse(
-          JSON.parse(last.slice(4)),
-        );
-        found = page.items.some((h) => h.id === id);
-      }
-      if (found || Date.now() >= deadline) break;
-      await new Promise((res) => setTimeout(res, 2_000));
-    }
-    expect(found, `not found in 60 s; last search response: ${last}`).toBe(
-      true,
-    );
+        const b = await buffered(r, signal);
+        return { status: b.status, text: await b.text() };
+      },
+      search: async (signal) => {
+        const r = await fetch(`${base}${R.search}?q=${word}`, {
+          headers: auth,
+          signal,
+        });
+        const b = await buffered(r, signal);
+        return { status: b.status, text: await b.text() };
+      },
+      indexed: (text) =>
+        z.array(VersionInfoSchema).parse(JSON.parse(text))[0]?.textIndexed ===
+        true,
+      listed: (text) =>
+        PageSchema(SearchHitSchema)
+          .parse(JSON.parse(text))
+          .items.some((h) => h.id === id),
+      budgetMs: 60_000,
+      holdMs: 25_000,
+      quickMax: 5,
+    });
     const anon = await fetch(`${base}${R.search}?q=${word}`);
     expect(anon.status).toBe(401);
   }, 75_000);

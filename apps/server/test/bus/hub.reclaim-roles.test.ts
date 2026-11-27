@@ -1,11 +1,12 @@
-// #1816: a #1742 reclaim moves the roles the away row held to the newcomer, so
-// a restarted lead keeps its role; a role with a reach_grants row stays vacant
-// (holding it grants reach, which needs the member's confirmation, #1346).
-// Also: a vacant/away role and an away agent of the same name in two linked
+// #1816 / #3132: a new session asking an away session's chosen name no longer
+// reclaims it (#3132): it gets a suffixed session name and asks for the role of
+// that name, so every role the away row held stays on it, reach grants and
+// all, until the holder hands over or the member decides (a hub.putRole to the
+// newcomer moves that one role, #1346 reach still needs the member). Also: a vacant/away role and an away agent of the same name in two linked
 // namespaces are ambiguous. Time is BusHub.setTestClock; no sleeps.
 import { runInDurableObject } from "cloudflare:test";
 import { BUS_CAPS, type ClientFrame, type ServerFrame } from "@oa/bus-protocol";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BusHub } from "../../src/bus/hub.js";
 import {
   type Daemon,
@@ -13,9 +14,14 @@ import {
   hubOf,
   machine,
   ns,
-  up,
+  up as plainUp,
   waitFor,
 } from "./helpers.js";
+import { eventually } from "./helpers.ts";
+
+/** #3143: only a name a person gave is a role, so these tests' sessions choose theirs. */
+const up = (...a: Parameters<typeof plainUp>): ReturnType<typeof plainUp> =>
+  ({ ...plainUp(...a), name_chosen: true }) as ClientFrame;
 
 const inHub = async <R>(fn: (i: BusHub, s: DurableObjectState) => R) =>
   runInDurableObject(await hubOf(), fn);
@@ -75,17 +81,15 @@ async function send(d: Daemon, from: string, to: string): Promise<Receipt> {
   }
 }
 
-const close = async (d: Daemon, ref: string) => {
-  d.send({ v: 1, id: id("c"), type: "sessions", open: [], closed: [ref] });
-  for (let k = 0; k < 400; k++) {
+const close = async (d: Daemon, ref: string, open: string[] = []) => {
+  d.send({ v: 1, id: id("c"), type: "sessions", open, closed: [ref] });
+  await eventually(async () => {
     const r = await sqlOf<{ live: number }>(
       "select live from agents where native_ref = ? order by rowid desc limit 1",
       ref,
     );
-    if (r[0]?.live === 0) return;
-    await new Promise((res) => setTimeout(res, 5));
-  }
-  throw new Error("close never applied");
+    expect(r[0]?.live).toBe(0);
+  });
 };
 
 const agentId = async (ref: string) =>
@@ -134,24 +138,26 @@ const shut = (s: Scene) => {
   s.snd.close();
 };
 
-describe("a reclaimed name keeps its roles (#1816)", () => {
-  it("a plain role moves to the newcomer and a send to it delivers there", async () => {
+describe("a held name keeps its roles from a new session (#1816, #3132)", () => {
+  it("a plain role stays with the away holder: a send to it queues for the holder, the newcomer gets none", async () => {
     const s = await scene();
     const role = uniq("role");
     await holds(s.n, role, s.oldRef);
     await close(s.d, s.oldRef);
     expect(await holderRef(role)).toBe(s.oldRef);
     const ref = uniq("new");
-    expect(await reg(s.d, ref, s.name, s.n)).toBe(s.name);
-    expect(await holderRef(role)).toBe(ref);
+    expect(await reg(s.d, ref, s.name, s.n)).toBe(`${s.name}-2`);
+    expect(await holderRef(role)).toBe(s.oldRef);
     const r = await send(s.snd, "snd", role);
-    const dl = await waitFor(s.d, "deliver");
-    expect(dl.msg_id).toBe(r.msg_id);
-    expect(dl.to_ref).toBe(ref);
+    expect(r).toMatchObject({
+      state: "pending",
+      queued: "away",
+      to_name: s.name,
+    });
     shut(s);
   });
 
-  it("two roles held by the same row both move", async () => {
+  it("two roles held by the same row both stay", async () => {
     const s = await scene();
     const [r1, r2] = [uniq("roleA"), uniq("roleB")];
     await holds(s.n, r1, s.oldRef);
@@ -159,11 +165,14 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
     await close(s.d, s.oldRef);
     const ref = uniq("new");
     await reg(s.d, ref, s.name, s.n);
-    expect([await holderRef(r1), await holderRef(r2)]).toEqual([ref, ref]);
+    expect([await holderRef(r1), await holderRef(r2)]).toEqual([
+      s.oldRef,
+      s.oldRef,
+    ]);
     shut(s);
   });
 
-  it("rename: a live session renamed to the away name takes the roles too", async () => {
+  it("rename: a live session renamed to the away name asks and takes no roles", async () => {
     const s = await scene();
     const role = uniq("role");
     await holds(s.n, role, s.oldRef);
@@ -175,23 +184,26 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
       v: 1,
       id: fid,
       type: "rename",
+      name_chosen: true,
       agent_ref: ref,
       proposed_name: s.name,
     } as ClientFrame);
-    await waitFor(s.d, "renamed");
-    expect(await holderRef(role)).toBe(ref);
+    expect((await waitFor(s.d, "renamed")).bus_name).toBe(`${s.name}-2`);
+    expect(await holderRef(role)).toBe(s.oldRef);
     shut(s);
   });
 
-  it("the holder changes from the old row to the newcomer, and only then", async () => {
+  it("the name's role changes from the old row to the newcomer only when the member confirms it; the old row's other roles stay", async () => {
     const s = await scene();
     const role = uniq("role");
     await holds(s.n, role, s.oldRef);
     await close(s.d, s.oldRef);
-    expect(await holderRef(role)).toBe(s.oldRef);
     const ref = uniq("new");
     await reg(s.d, ref, s.name, s.n);
-    expect(await holderRef(role)).toBe(ref);
+    expect(await holderRef(s.name)).toBe(s.oldRef);
+    await holds(s.n, s.name, ref);
+    expect(await holderRef(s.name)).toBe(ref);
+    expect(await holderRef(role)).toBe(s.oldRef);
     shut(s);
   });
 
@@ -214,7 +226,7 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
     shut(s);
   });
 
-  it("a newcomer already holding a role gains the second", async () => {
+  it("a newcomer already holding a role keeps it and gains no second by asking", async () => {
     const s = await scene();
     const [r1, r2] = [uniq("roleA"), uniq("roleB")];
     await holds(s.n, r1, s.oldRef);
@@ -227,11 +239,12 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
       v: 1,
       id: fid,
       type: "rename",
+      name_chosen: true,
       agent_ref: ref,
       proposed_name: s.name,
     } as ClientFrame);
     await waitFor(s.d, "renamed");
-    expect([await holderRef(r1), await holderRef(r2)]).toEqual([ref, ref]);
+    expect([await holderRef(r1), await holderRef(r2)]).toEqual([s.oldRef, ref]);
     shut(s);
   });
 
@@ -257,7 +270,7 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
     d.close();
   });
 
-  it("a role with reach stays vacant for the newcomer and keeps its grants", async () => {
+  it("a role with reach stays on the away holder and keeps its grants", async () => {
     const s = await scene();
     const [plain, granted] = [uniq("plain"), uniq("granted")];
     const target = ns("rt");
@@ -268,9 +281,8 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
     );
     await close(s.d, s.oldRef);
     const ref = uniq("new");
-    expect(await reg(s.d, ref, s.name, s.n)).toBe(s.name);
-    expect(await holderRef(plain)).toBe(ref);
-    // The granted role still points at the old (closed) row: vacant, no reach.
+    expect(await reg(s.d, ref, s.name, s.n)).toBe(`${s.name}-2`);
+    expect(await holderRef(plain)).toBe(s.oldRef);
     expect(await holderRef(granted)).toBe(s.oldRef);
     expect(
       await sqlOf<{ n: number }>(
@@ -279,7 +291,7 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
       ),
     ).toEqual([{ n: 1 }]);
     const r = await send(s.snd, "snd", granted);
-    expect(r).toMatchObject({ state: "refused", reason: "role_vacant" });
+    expect(r).toMatchObject({ state: "pending", queued: "away" });
     shut(s);
   });
 
@@ -290,7 +302,7 @@ describe("a reclaimed name keeps its roles (#1816)", () => {
     await reg(s.d, other, otherName, s.n);
     const role = uniq("role");
     await holds(s.n, role, other);
-    await close(s.d, other);
+    await close(s.d, other, [s.oldRef]);
     await close(s.d, s.oldRef);
     await reg(s.d, uniq("new"), s.name, s.n);
     expect(await holderRef(role)).toBe(other);
@@ -311,10 +323,10 @@ describe("a vacant role and an away agent in two linked namespaces (#1816)", () 
     // B: a role named `name` whose holder is closed (vacant).
     await reg(d, "hb", uniq("Holder"), b);
     await holds(b, name, "hb");
-    await close(d, "hb");
+    await close(d, "hb", ["me"]);
     // C: an agent named `name`, closed (away).
     await reg(d, "ac", name, c);
-    await close(d, "ac");
+    await close(d, "ac", ["me"]);
     const r = await send(d, "me", name);
     expect(r).toMatchObject({ state: "refused", reason: "ambiguous" });
     d.close();
@@ -328,7 +340,7 @@ describe("a vacant role and an away agent in two linked namespaces (#1816)", () 
     const name = uniq("Solo");
     await reg(d, "me", uniq("Me"), a);
     await reg(d, "ac", name, c);
-    await close(d, "ac");
+    await close(d, "ac", ["me"]);
     const r = await send(d, "me", name);
     expect(r).toMatchObject({ state: "pending", queued: "away" });
     d.close();

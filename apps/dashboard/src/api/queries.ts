@@ -1,7 +1,9 @@
 import {
   type ArtifactPatch,
   ArtifactSummarySchema,
+  type AwayRoleAction,
   BUS_MACHINES_PAUSED_HEADER,
+  BUS_MACHINES_VERSIONS_HEADER,
   type BusAddress,
   BusAgentsSchema,
   type BusLinkPut,
@@ -13,6 +15,7 @@ import {
   BusRoleSchema,
   BusRolesSchema,
   DocVersionResultSchema,
+  HandleAvailabilitySchema,
   type ListQueryInput,
   ListQuerySchema,
   type Me,
@@ -235,7 +238,7 @@ export const useOnboarding = (enabled = true) =>
     queryFn: ({ signal }) => api.get(R.onboarding, OnboardingSchema, signal),
   });
 /**
- * PUT R.onboarding: turn on `dismissed` or `completed`; the cache shows the answer.
+ * PUT R.onboarding: turn on `dismissed` or `completed` (`dismissed: false` shows a hidden checklist again); the cache shows the answer.
  * #2632: `member` saves a member's own; today's server refuses that with 403,
  * which is "not saved": no error, the change stays for this session.
  */
@@ -307,7 +310,10 @@ export const useBusMachines = (enabled = true) =>
     // the plain `{ machines }` answer it can parse.
     queryFn: ({ signal }) =>
       api.get(R.busMachines, BusMachinesSchema, signal, {
-        headers: { [BUS_MACHINES_PAUSED_HEADER]: "1" },
+        headers: {
+          [BUS_MACHINES_PAUSED_HEADER]: "1",
+          [BUS_MACHINES_VERSIONS_HEADER]: "1",
+        },
       }),
     refetchInterval: BUS_POLL_MS,
   });
@@ -396,6 +402,13 @@ export const usePutBusRole = () => {
     onSettled: () => qc.invalidateQueries({ queryKey: qk.busRoles }),
   });
 };
+export const useAwayRoleAction = () =>
+  useInvalidating(
+    (action: AwayRoleAction) => api.send("POST", R.busRoles, action),
+    () => [qk.busRoles, qk.busAgents],
+    "Couldn’t update the held name.",
+  );
+
 /** Remove a role (DELETE R.busRole(id), idempotent). */
 export const useDeleteBusRole = () =>
   useInvalidating(
@@ -721,6 +734,17 @@ export const useUpdateMe = () => {
   return useMutation({
     mutationFn: (patch: MePatch) => api.send("PATCH", R.me, patch, MeSchema),
     onSuccess: (me) => qc.setQueryData(qk.me, me),
+    onError: (error, patch) => {
+      if (
+        patch.handle &&
+        error instanceof ApiClientError &&
+        error.status === 409
+      ) {
+        const check = HandleAvailabilitySchema.safeParse(error.details);
+        if (check.success)
+          qc.setQueryData(["handle-availability", patch.handle], check.data);
+      }
+    },
   });
 };
 

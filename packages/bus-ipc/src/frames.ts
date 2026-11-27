@@ -3,6 +3,7 @@ import {
   AgentKindSchema,
   AgentRefSchema,
   BusNameSchema,
+  CODEX_SPAWNED_SOURCES,
   IsoTimeSchema,
   KindTokenSchema,
   LinkProofHashSchema,
@@ -100,9 +101,24 @@ export const ADAPTER_CAPS = {
    * the frame only to a daemon whose welcome listed it.
    */
   link: "link",
+  /**
+   * `agy_watch` (agy S3): this antigravity connection is the watcher of one
+   * agy process, not a conversation. Its hello names the watcher's own pid
+   * and the agy process's start time; the daemon walks the watcher's parents
+   * to that agy process and pushes it `agy_deliver` frames, which it answers
+   * with `ack` or `agy_failed`. Any other request on it is refused.
+   */
+  agyWatch: "agy_watch",
 } as const;
 
 export { REACH_PROPOSAL_MAX };
+
+/** agy S3: the daemon's refusal of a second watcher for one agy process. */
+export const AGY_WATCHER_RUNNING =
+  "an oa-bus watcher already runs for this agy process";
+/** agy S3: the daemon's refusal of a watcher whose agy process has no conversation on the bus. */
+export const AGY_NO_SESSION =
+  "no conversation of this agy process is on the bus yet";
 
 export const Hello = z.object({
   ...base,
@@ -123,6 +139,8 @@ export const Hello = z.object({
     .max(64)
     .refine(isWellFormed, WELL_FORMED)
     .optional(),
+  /** Pi observed a person choose the proposed name. */
+  name_chosen: z.literal(true).optional(),
   /** What this adapter can decode (ADAPTER_CAPS); absent means none. */
   caps: z.array(z.string().max(32)).max(16).optional(),
   /**
@@ -176,11 +194,7 @@ export type Hello = z.infer<typeof Hello>;
  * not the user's (codex-rs `ThreadSource`, all present in the 0.165 binary).
  * The adapter refuses them; the daemon decides from Codex's own state.
  */
-export const SPAWNED_SOURCES: ReadonlySet<string> = new Set([
-  "subagent",
-  "guardian_review",
-  "memory_consolidation",
-]);
+export const SPAWNED_SOURCES: ReadonlySet<string> = CODEX_SPAWNED_SOURCES;
 
 /** A tool call's request: its reply carries the agent's late-delivery notices. */
 const optIn = { late: z.literal(true).optional() };
@@ -201,6 +215,16 @@ export const Send = z.object({
     .refine(isWellFormed, WELL_FORMED),
 });
 export const List = z.object({ ...base, ...optIn, type: z.literal("list") });
+/**
+ * #3043: the habits the bus pushes at session start, as one short text. One
+ * source: every adapter and extension asks the daemon rather than carrying a
+ * copy, so what a session is told is what the running bus says.
+ */
+export const Habits = z.object({
+  ...base,
+  ...optIn,
+  type: z.literal("habits"),
+});
 export const Self = z.object({
   ...base,
   ...optIn,
@@ -240,6 +264,8 @@ export const Rename = z.object({
   ...optIn,
   type: z.literal("rename"),
   name: z.string().min(1).max(64).refine(isWellFormed, WELL_FORMED),
+  /** Pi observed a person choose this name. */
+  name_chosen: z.literal(true).optional(),
 });
 /**
  * Follow, unfollow or list follows (#1317). The agent is the connection's
@@ -296,7 +322,7 @@ export type StatusRequest = z.infer<typeof StatusRequest>;
  */
 export const LinkProofRequest = z.object({
   ...base,
-  type: z.literal("link_proof"),
+  type: z.enum(["link_proof", "agy_call_seen"]),
   pid: z.number().int().positive(),
   hash: LinkProofHashSchema,
   /**
@@ -308,6 +334,13 @@ export const LinkProofRequest = z.object({
     .string()
     .regex(/^[a-z0-9-]{1,32}$/)
     .optional(),
+  /**
+   * agy S5: the Antigravity conversation this proof is for, from the
+   * tools/call `_meta` agy sends. Present, `pid` is an agy process and the
+   * daemon binds the hash only to the live antigravity session of that pid
+   * and conversation. Absent, the request is Claude's, as before.
+   */
+  conversation: AGENT_REF.optional(),
 });
 export type LinkProofRequest = z.infer<typeof LinkProofRequest>;
 
@@ -326,6 +359,21 @@ export const AdapterLinkProof = z
   .strict();
 export type AdapterLinkProof = z.infer<typeof AdapterLinkProof>;
 
+/**
+ * agy S3: the watcher could not hand `msg_id` to agy (`agentapi
+ * send-message` failed). Nothing reached the session, so the daemon may try
+ * again; a watcher answers each push with this or with `ack` (an ack means
+ * agy said it took the message). `outcome: "unknown"`: an earlier hand-off
+ * may have reached agy and agy's mailbox cannot say, so the watcher neither
+ * sends it again nor calls it delivered; the receipt stays pending.
+ */
+export const AgyFailed = z.object({
+  ...base,
+  type: z.literal("agy_failed"),
+  msg_id: MsgIdSchema,
+  outcome: z.literal("unknown").optional(),
+});
+
 export const AdapterFrame = z.discriminatedUnion("type", [
   Hello,
   Send,
@@ -339,7 +387,9 @@ export const AdapterFrame = z.discriminatedUnion("type", [
   Unfollow,
   Following,
   ProposeReach,
+  Habits,
   AdapterLinkProof,
+  AgyFailed,
 ]);
 export type AdapterFrame = z.infer<typeof AdapterFrame>;
 
@@ -495,6 +545,19 @@ export const Deliver = z
   .refine((d) => (d.body === undefined) !== (d.notice === undefined), {
     message: "deliver needs exactly one of body or notice",
   });
+/**
+ * agy S3: one bus message for the watcher to hand to agy with `agentapi
+ * send-message <conversation_id> <text>`. `text` is the framed message, as
+ * every harness reads a peer's (header, then the body as data); the watcher
+ * passes it as one argument and never reads it.
+ */
+export const AgyDeliver = z.object({
+  ...base,
+  type: z.literal("agy_deliver"),
+  msg_id: MsgIdSchema,
+  conversation_id: AGENT_REF,
+  text: z.string().min(1),
+});
 /** A short local notice from Open Artifacts bus (the sender's mail expired or was refused); never a message. */
 export const Notice = z.object({
   ...base,
@@ -623,6 +686,13 @@ export const LinkProofed = z.object({
   bound: z.boolean(),
 });
 
+/** The reply to `habits`: the rules, or null when this install opted out. */
+export const HabitsReply = z.object({
+  ...base,
+  type: z.literal("habits"),
+  rules: z.string().nullable(),
+});
+
 export const DaemonFrame = z.discriminatedUnion("type", [
   LinkProofed,
   Welcome,
@@ -631,6 +701,7 @@ export const DaemonFrame = z.discriminatedUnion("type", [
   Agent,
   Body,
   Deliver,
+  AgyDeliver,
   Notice,
   ErrorFrame,
   StatusReply,
@@ -639,5 +710,6 @@ export const DaemonFrame = z.discriminatedUnion("type", [
   Unfollowed,
   Follows,
   ReachProposed,
+  HabitsReply,
 ]);
 export type DaemonFrame = z.infer<typeof DaemonFrame>;

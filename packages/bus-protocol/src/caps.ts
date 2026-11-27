@@ -151,7 +151,33 @@ export const BUS_CAPS = {
    * refuse them).
    */
   guest: "guest",
+  /**
+   * Mail expiry: `deliver.expires_at` names when the hub drops an unacked
+   * mail receipt. The hub sets `deliver.expires_at` only to a socket whose
+   * hello listed it, and lists it in `hello_ok.caps`: Deliver is a strict
+   * object, so an older daemon would refuse the field.
+   */
+  mailExpiry: "mail_expiry",
+  /**
+   * Sessions gone (#3208): the client may send `sessions.gone` (refs of closed
+   * sessions that will never reopen, a subset of `closed`); the hub expires
+   * their pending mail as `recipient_closed` and drops their away
+   * reservations. The hub lists it in `hello_ok.caps`; a client sends it only
+   * after `hello_ok.caps` listed it (older hubs refuse the key).
+   */
+  sessionsGone: "sessions_gone",
+  /**
+   * #3108: the hub may send `codex_call_check` (a /mcp tools/call signed in
+   * as this member, with no proof, named a Codex thread and call) and the
+   * daemon answers `codex_call_checked`. Sent only to a socket whose hello
+   * listed it, and listed in `hello_ok.caps`.
+   */
+  codexCheck: "codex_check",
+  agyCheck: "agy_check",
 } as const;
+/** Opt-in on the socket upgrade: released hubs accept at most 16 hello caps. */
+export const CODEX_VERDICT_HEADER = "x-oa-codex-link-verdict";
+
 export type BusCap = (typeof BUS_CAPS)[keyof typeof BUS_CAPS];
 
 /**
@@ -177,3 +203,6 @@ export function hasCap(
 ): boolean {
   return hello?.caps?.includes(cap) ?? false;
 }
+
+/** Native agy proof support on the upgrade; legacy hubs accept at most 16 hello caps. */
+export const AGY_CHECK_HEADER = "x-oa-bus-agy-check";

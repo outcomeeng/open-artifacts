@@ -1,10 +1,13 @@
 import {
   type ArtifactPatch,
   type ArtifactSummary,
+  type Capabilities,
   type DataWriters,
   type ShareRole,
+  ShareRoleSchema,
   type Share as ShareRow,
   ShareSchema,
+  shareRoleLabel,
   type Visibility,
   viewerPath,
 } from "@oa/shared";
@@ -15,6 +18,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
   ToggleGroup,
@@ -59,11 +63,9 @@ import { isOrgAdmin } from "../../settings/spaces/access";
 import {
   type NotEmailed,
   notEmailedLine,
-  OUTSIDER_DEFAULT,
   outsideAddress,
   outsideLine,
-  roleLabel,
-  roleOptions,
+  shareRoles,
   WORKSPACE_ONLY_ADMIN,
   workspaceOnlyNote,
 } from "./shareRoles";
@@ -192,44 +194,62 @@ function RecipientLine({
   );
 }
 
-/**
- * A share's role. #2590: an outsider's choices are Can comment and Can view
- * (OA Product); a member's stay Viewer and Editor.
- */
 function RoleSelect({
   label,
   value,
   onChange,
-  outsider = false,
+  onRemove,
 }: {
   label: string;
   value: ShareRole;
-  onChange: (r: ShareRole) => void;
-  outsider?: boolean;
+  onChange: (role: ShareRole) => void;
+  onRemove?: () => void;
 }) {
-  const options = roleOptions(outsider, value);
   return (
-    <Select value={value} onValueChange={(v) => onChange(v as ShareRole)}>
+    <Select
+      value={value}
+      onValueChange={(v) => {
+        if (v === "remove") onRemove?.();
+        else onChange(ShareRoleSchema.parse(v));
+      }}
+    >
       <SelectTrigger
         aria-label={label}
         size="sm"
-        className={`${outsider ? "w-[140px]" : "w-[96px]"} flex-none ${TEXT}`}
+        className={`w-[140px] flex-none ${TEXT}`}
       >
         <SelectValue />
       </SelectTrigger>
       <SelectContent position="popper">
-        {options.map((r) => (
-          <SelectItem key={r.value} value={r.value} className={TEXT}>
-            {r.label}
+        {shareRoles.map((role) => (
+          <SelectItem key={role} value={role} className={TEXT}>
+            {shareRoleLabel(role)}
           </SelectItem>
         ))}
+        {onRemove && (
+          <>
+            <SelectSeparator />
+            <SelectItem value="remove" className={TEXT}>
+              Remove access
+            </SelectItem>
+          </>
+        )}
       </SelectContent>
     </Select>
   );
 }
 
-export function Share({ artifact }: { artifact: ArtifactSummary }) {
+export function Share({
+  artifact,
+  usedCaps,
+}: {
+  artifact: ArtifactSummary;
+  /** #3037: the live data boxes this page's code has used (the frame's calls). */
+  usedCaps?: ReadonlySet<keyof Capabilities>;
+}) {
   const { id } = artifact;
+  // #3037: only a page's own code can call the live data boxes.
+  const onPage = artifact.format === "html";
   const can = useCan(artifact);
   const vis = can.setVisibility;
   const people = can.share;
@@ -259,9 +279,7 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
     stage?.from === artifact.visibility ? stage.to : artifact.visibility;
   const changed = staged !== artifact.visibility;
   const [email, setEmail] = useState("");
-  // A member's pick, and an outsider's (#2590: Can comment unless changed).
-  const [role, setRole] = useState<ShareRole>("viewer");
-  const [outsiderRole, setOutsiderRole] = useState<ShareRole>(OUTSIDER_DEFAULT);
+  const [pick, setRole] = useState<ShareRole>("editor");
   const [invalid, setInvalid] = useState(false);
   const [shared, setShared] = useState<{
     email: string;
@@ -276,7 +294,7 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
     pausedUntil?: string;
     /** How they sign in, from the server (older servers omit it). */
     with: string | null;
-    /** The role picked: a guest's row corrects Editor, once, just after. */
+    /** The role returned by the server. */
     role: ShareRole;
   } | null>(null);
   const domains = useSignInDomains();
@@ -308,7 +326,6 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
   const typedOutside =
     outsideAddress(email, domainList, listMembers ? known : null) === true;
   const outsideNote = typedOutside ? outsideLine(email.trim(), methods) : null;
-  const pick = typedOutside ? outsiderRole : role;
   // #2577: sharing for editing with a teammate can also let them ask the caller's agents here.
   // The box shows only on a server that has the list routes; the person is
   // known (memberId) once the share is saved.
@@ -366,6 +383,7 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
           onSettled: done,
           onSuccess: (r) => {
             setEmail("");
+            setRole("editor");
             setAskTick(false);
             if (listen) {
               if (r.memberId)
@@ -391,9 +409,7 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
                   tone: "neutral",
                 });
             }
-            // #2590: the server may store another role than the one picked
-            // (an outsider's Editor becomes commenter): the row shows the
-            // stored one at once, before the list refetches.
+            // Show the saved role immediately, before the list refetches.
             qc.setQueryData<ShareRow[]>(qk.shares(id), (list) => {
               if (!list) return list;
               const was = list.find((x) => x.email === r.email);
@@ -568,12 +584,7 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
                 setInvalid(false);
               }}
             />
-            <RoleSelect
-              label="Invite role"
-              outsider={typedOutside}
-              value={pick}
-              onChange={typedOutside ? setOutsiderRole : setRole}
-            />
+            <RoleSelect label="Invite role" value={pick} onChange={setRole} />
             <Button
               type="submit"
               variant="outline"
@@ -717,49 +728,36 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
             // the shares on an address (DROP_SHARES) in the same batch, before
             // it writes the removed+<id>@invalid placeholder (directory/apply.ts).
             const controls = people ? (
-              <>
-                <RoleSelect
-                  label={`Role for ${s.email}`}
-                  outsider={s.guest === true}
-                  value={s.role}
-                  onChange={(r) =>
-                    put.mutate(
-                      { email: s.email, role: r },
-                      { onError: (x) => fail(x, "Couldn't change role") },
-                    )
-                  }
-                />
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="size-[30px] flex-none p-0"
-                  aria-label={`Remove ${s.email}`}
-                  onClick={() =>
-                    removeOnce((done) =>
-                      del.mutate(s.email, {
-                        onSettled: done,
-                        onSuccess: () =>
-                          setShared((x) => (x?.email === s.email ? null : x)),
-                        onError: (x) => fail(x, "Couldn't remove"),
-                      }),
-                    )
-                  }
-                >
-                  ×
-                </Button>
-              </>
+              <RoleSelect
+                label={`Role for ${s.email}`}
+                value={s.role}
+                onChange={(r) =>
+                  put.mutate(
+                    { email: s.email, role: r },
+                    { onError: (x) => fail(x, "Couldn't change role") },
+                  )
+                }
+                onRemove={() =>
+                  removeOnce((done) =>
+                    del.mutate(s.email, {
+                      onSettled: done,
+                      onSuccess: () =>
+                        setShared((x) => (x?.email === s.email ? null : x)),
+                      onError: (x) => fail(x, "Couldn't remove"),
+                    }),
+                  )
+                }
+              />
             ) : (
               <span className="text-muted-foreground">
-                {roleLabel(s.role, s.guest === true)}
+                {shareRoleLabel(s.role)}
               </span>
             );
             // Guests first; then a member who can only view (never why),
             // flagged only where the stored role says more than they get.
-            // #2590: an outsider's picker says Can comment or Can view;
-            // only an old Editor share on a guest still needs the caption.
             const caption = s.guest
               ? s.role === "editor"
-                ? "Guest · can only view for now"
+                ? "Editor once they join the team"
                 : null
               : s.viewOnly && s.role === "editor"
                 ? "Can only view for now"
@@ -842,21 +840,45 @@ export function Share({ artifact }: { artifact: ArtifactSummary }) {
 
       <section>
         <h3 className={H3}>Live data</h3>
-        {CAPS.map(([k, label, hint]) => (
-          <div className="oa-cap" key={k}>
-            <LabelledCheckbox
-              id={`oa-cap-${k}`}
-              describedBy={`oa-cap-${k}-hint`}
-              label={label}
-              checked={artifact.capabilities[k]}
-              disabled={!vis || patch.isPending}
-              onCheckedChange={(on) => setCap(k, on)}
-            />
-            <small id={`oa-cap-${k}-hint`} className="oa-muted">
-              {hint}
-            </small>
-          </div>
-        ))}
+        {/* #3037: usage marks only where a page's own code runs. */}
+        {CAPS.map(([k, label, hint]) => {
+          // #3037: only a page's own code can call these, so only an html page
+          // has marks; a doc, image, pdf or code artifact can't use them.
+          const used = onPage && usedCaps?.has(k);
+          return (
+            <div className="oa-cap" key={k}>
+              <LabelledCheckbox
+                id={`oa-cap-${k}`}
+                describedBy={`oa-cap-${k}-hint`}
+                label={label}
+                checked={artifact.capabilities[k]}
+                disabled={!vis || patch.isPending}
+                onCheckedChange={(on) => setCap(k, on)}
+              />
+              <small id={`oa-cap-${k}-hint`} className="oa-muted">
+                {hint}
+              </small>
+              {onPage && (
+                // #3037 review: a page's own calls set this, so the copy only
+                // reports, in the same muted ink as the hint: it never urges
+                // the owner to widen access on the page's say-so.
+                <small
+                  data-cap-used={used ? "" : undefined}
+                  className="oa-muted"
+                >
+                  {used
+                    ? artifact.capabilities[k]
+                      ? "This page uses it."
+                      : `This page asked for it. It's off.${k === "viewer" ? " Turning it on shows this page each viewer's name and email." : ""}`
+                    : // The marks are calls seen this visit, not a promise about
+                      // the page: a box used on a click or after a delay is not
+                      // "unused", it just has not been used yet.
+                      "Not used yet on this visit."}
+                </small>
+              )}
+            </div>
+          );
+        })}
         {artifact.capabilities.db && (
           <div className="oa-cap">
             <p id="oa-share-writers" className="font-medium">

@@ -5,16 +5,30 @@ import {
   createEventLog,
   type Daemon,
   type DaemonDeps,
+  defaultSkillRefresher,
   runDaemon,
   START_ERROR_CODES,
 } from "@oa/bus-daemon";
 import { wiredTo } from "../bus-cmd.ts";
 import { type Ctx, sayErr } from "../context.ts";
 import { originOf, readMachine } from "../machine.ts";
-import { reapplyClaudeProof } from "../steps/adapters.ts";
+import {
+  type AdapterDeps,
+  agyOn,
+  type RefreshResult,
+  readAssets,
+  reapplyClaudeProof,
+  reapplyCodexEntries,
+  refreshAdapters,
+} from "../steps/adapters.ts";
 import { readRecord } from "../steps/claude-proof.ts";
 import { PROOF_EVENT } from "../steps/claude-proof-check.ts";
+import { removeHabitsBlocks } from "../steps/habits.ts";
 import { REVOKED_EXIT } from "../steps/service.ts";
+import { HABITS_MOVED_LINE } from "./habits.ts";
+
+export const REFRESH_EVENT = "adapter_refreshed";
+export const REFRESH_SKIPPED_EVENT = "adapter_refresh_skipped";
 
 export type Signals = Pick<NodeJS.Process, "once" | "off">;
 
@@ -39,6 +53,7 @@ export async function daemon(
   ctx: Ctx,
   run: (deps: DaemonDeps) => Promise<Daemon> = runDaemon,
   signals: Signals = process,
+  refresh: (deps: AdapterDeps) => Promise<RefreshResult> = refreshAdapters,
 ): Promise<number> {
   // A marker for an older token is stale: `login` saved a newer one since.
   const m = readMachine(ctx.home);
@@ -51,12 +66,13 @@ export async function daemon(
   }
   // Always on: ~/.oa-bus/logs/events.log (the service owns daemon.log's fd); `oa-bus logs` shows both.
   const events = createEventLog(join(ctx.home, "logs", "events.log"));
+  const wired = m.state === "ok" && wiredTo(ctx);
   // #2688: an update restarts the daemon, so this also runs after `oa-bus update`.
   // Only for a bus the harness configs name, and only in the Claude config
   // file install recorded: another bus, or a config nothing was recorded for,
   // is never touched.
   const config = readRecord(join(ctx.home, "install.json")).config;
-  if (m.state === "ok" && config !== undefined && wiredTo(ctx))
+  if (wired && config !== undefined)
     reapplyClaudeProof(
       {
         home: ctx.userHome,
@@ -68,6 +84,29 @@ export async function daemon(
       },
       (c) => events(PROOF_EVENT, { name: c.entry, kind: c.scope }),
     );
+  // #3108: the same for the Codex entries the server check links.
+  if (m.state === "ok")
+    reapplyCodexEntries({
+      home: ctx.userHome,
+      busHome: ctx.home,
+      env: ctx.env,
+      hub: originOf(m.hub),
+    });
+  // #3043: an auto-update restarts the daemon without running install, so
+  // remove any old habit blocks here too (only for the bus the harnesses name).
+  if (wiredTo(ctx)) {
+    try {
+      const removed = removeHabitsBlocks({
+        home: ctx.userHome,
+        env: ctx.env,
+        busHome: ctx.home,
+      });
+      if (removed.files.length > 0) {
+        sayErr(ctx, HABITS_MOVED_LINE(removed.files.length));
+        events("habits_removed", { files: removed.files.length });
+      }
+    } catch {}
+  }
   return new Promise<number>((resolve) => {
     let running: Daemon | undefined;
     let ended = false;
@@ -83,6 +122,7 @@ export async function daemon(
     signals.once("SIGTERM", onSignal);
     run({
       version: ctx.version,
+      antigravity: { discover: agyOn(ctx.env, ctx.home) },
       events,
       // Only an older token was revoked: a restart picks up the new one.
       onRevoked: (replaced) => end(replaced ? 1 : REVOKED_EXIT),
@@ -90,10 +130,41 @@ export async function daemon(
       onSocketLost: () => end(1),
       // #2552: the updater ends the daemon non-zero to restart it from a new `bin`.
       update: { entryFile: fileURLToPath(import.meta.url), exit: end },
+      // #3203: a new instance release rewrites the installed skills.
+      skillRefresh: defaultSkillRefresher(
+        ctx.home,
+        (msg) => sayErr(ctx, msg),
+        fileURLToPath(import.meta.url),
+      ),
     }).then(
       (d) => {
         running = d;
-        if (ended) void d.stop();
+        if (ended) {
+          void d.stop();
+          return;
+        }
+        const busBin = ctx.service.argv?.() ?? [];
+        if (wired && busBin.length > 0) {
+          try {
+            void refresh({
+              home: ctx.userHome,
+              busHome: ctx.home,
+              env: ctx.env,
+              busBin,
+              assets: readAssets(),
+              which: ctx.which,
+              exec: ctx.exec,
+              codexApp: ctx.codexApp,
+            }).then(
+              (r) => {
+                for (const h of r.refreshed) events(REFRESH_EVENT, { name: h });
+                for (const s of r.skipped)
+                  events(REFRESH_SKIPPED_EVENT, { name: s.harness });
+              },
+              () => {},
+            );
+          } catch {}
+        }
       },
       (e: unknown) => {
         const msg = e instanceof Error ? e.message : String(e);

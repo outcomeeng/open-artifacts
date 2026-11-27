@@ -200,16 +200,36 @@ export const securityHeaders =
 const BEARER = /^\s*Bearer(?:\s+(.*?))?\s*$/i;
 
 /**
+ * A row's code session (SessionPayload.m, #3184; #3082's invited member
+ * cookies carry the same m: 1) still qualifies, as codeRule would admit it
+ * now: a code session with no tenant, the row still an owner, admin or member
+ * (not a guest), and the install still offering codes. The row is already
+ * loaded (active only, epoch checked). No D1.
+ */
+export function rowCodeStillOk(
+  env: Env,
+  s: Session,
+  user: Pick<Member, "role">,
+): boolean {
+  if (s.p !== "code" || s.t !== undefined || isGuestRole(user.role))
+    return false;
+  return authConfig(env).emailCodes;
+}
+
+/**
  * A signed session is still good for this user and install: its epoch is the
  * user's current one (a bump ends every session), its tenant, if any, is
  * still a verified domain, and a domain-code session ends once Google is on.
+ * A row's code session (m) also needs rowCodeStillOk.
  */
 export function sessionStillValid(
   env: Env,
   s: Session,
   sessionEpoch: number,
+  user?: Pick<Member, "role" | "email">,
 ): boolean {
   if ((s.e ?? 0) !== sessionEpoch) return false;
+  if (s.m === 1) return !!user && rowCodeStillOk(env, s, user);
   if (s.t === undefined) return true;
   const cfg = authConfig(env);
   if (!inDomains(cfg.domains, s.t)) return false;
@@ -279,7 +299,7 @@ export async function resolveSession(c: Context<AppEnv>): Promise<void> {
     else if (
       s &&
       row &&
-      sessionStillValid(c.env, s, row.sessionEpoch) &&
+      sessionStillValid(c.env, s, row.sessionEpoch, row.user) &&
       !sessionCapped(row.capSince, s.iat, Date.now())
     ) {
       // The cap travels on the member itself (authz CAP, set once by getUser
@@ -288,7 +308,9 @@ export async function resolveSession(c: Context<AppEnv>): Promise<void> {
       // A restricted member stays "restricted"; anyone else becomes "guest",
       // whatever the billing plan says: the plan cap exempts admin reads
       // and billing, which a session this weak must not keep.
-      if (s.p === "code" && s.t === undefined)
+      // A row's code session (m) passed sessionStillValid: the owner, admin
+      // or member, uncapped, as a domain member's code session is.
+      if (s.p === "code" && s.t === undefined && s.m !== 1)
         c.set(
           "user",
           withCap(
@@ -395,7 +417,7 @@ const auditBreakGlass = (
  */
 async function meBreakGlass(c: Context<AppEnv>, s: Session): Promise<void> {
   const row = await getMismatchOwner(c.env, s.uid);
-  if (!row || !sessionStillValid(c.env, s, row.sessionEpoch)) return;
+  if (!row || !sessionStillValid(c.env, s, row.sessionEpoch, row.user)) return;
   const now = Date.now();
   // The 401 still names the session that asked: its use is audited as such.
   setCred({ kind: "session", id: sessionCredId(s) });
@@ -420,7 +442,7 @@ async function meBreakGlass(c: Context<AppEnv>, s: Session): Promise<void> {
  */
 async function breakGlass(c: Context<AppEnv>, s: Session): Promise<void> {
   const row = await getMismatchOwner(c.env, s.uid);
-  if (!row || !sessionStillValid(c.env, s, row.sessionEpoch)) return;
+  if (!row || !sessionStillValid(c.env, s, row.sessionEpoch, row.user)) return;
   const now = Date.now();
   if (!breakGlassFresh(s, now))
     throw new ApiError(

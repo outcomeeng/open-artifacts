@@ -1,5 +1,6 @@
 import {
   type ArtifactSummary,
+  type Capabilities,
   isExpiredMessage,
   type Me,
   viewerPath,
@@ -34,8 +35,14 @@ import { useDocumentTitle } from "../layout/useDocumentTitle";
 import { isMember } from "../library/MemberGetStarted";
 import { NotFound } from "../pages/NotFound";
 import { NotPublic } from "../pages/NotPublic";
-import { createBridge, type ScrollPos, type WelcomeGreet } from "./bridge";
+import {
+  type AskSlotRect,
+  createBridge,
+  type ScrollPos,
+  type WelcomeGreet,
+} from "./bridge";
 import { Crumbs } from "./Crumbs";
+import { AskSlots } from "./comments/AskSlots";
 import { asksForMe, nextAskFor } from "./comments/asks";
 import {
   CommentsBody,
@@ -279,6 +286,14 @@ function Viewer({
       })) as never,
     });
   const bridge = useRef<Bridge | null>(null);
+  // #2426 B: where the page's `[data-oa-ask]` slots are, as the frame last said.
+  const [askSlots, setAskSlots] = useState<
+    { key: string; rect: AskSlotRect }[]
+  >([]);
+  const setAskSlotSize = useCallback(
+    (key: string, h: number) => bridge.current?.setAskSlotSize(key, h),
+    [],
+  );
   // Comments (#682). The list lives in a column beside the page, a tab of the
   // side panel, or a dialog (phones, full screen).
   const surface = useSurface(chromeless);
@@ -409,6 +424,14 @@ function Viewer({
   });
   const cbs = useRef({ onReady, onTouched, onAccessLost, onScroll });
   cbs.current = { onReady, onTouched, onAccessLost, onScroll };
+  // #3037: the live data boxes this page's code has called for. The layer
+  // remounts per version, so a new version starts the marks over.
+  const [usedCaps, setUsedCaps] = useState<ReadonlySet<keyof Capabilities>>(
+    new Set(),
+  );
+  const noteUse = useCallback((cap: keyof Capabilities) => {
+    setUsedCaps((prev) => (prev.has(cap) ? prev : new Set(prev).add(cap)));
+  }, []);
   // Fixed at mount: a swap shows this layer on load, before its hello.
   const restore = useRef(restoreScroll);
   // biome-ignore lint/correctness/useExhaustiveDependencies: once, on mount
@@ -695,6 +718,11 @@ function Viewer({
       url: src,
       ...latest.current,
       onboarding: () => gate.current,
+      // #3037: what this page's code reaches for, for the Share panel. In
+      // memory only: a full page reload clears the marks, a frame reload keeps
+      // them. It is a report of calls so far, never a promise of what the page
+      // needs.
+      onCapability: noteUse,
       version,
       formatOf: () => formatRef.current,
       onHello: () => {
@@ -718,6 +746,7 @@ function Viewer({
       onCommentEscape: () => cmtRef.current.onEscape(),
       onCommentSelection: (has) => cmtRef.current.onSelection(has),
       onCommentAway: () => cmtRef.current.onAway(),
+      onAskSlots: setAskSlots,
       onPdfText: (t) => fxRef.current.onPdfText(t),
       onThumb: (b) => fxRef.current.onThumb(b),
       // The shell re-checks access: still readable, or the gone state.
@@ -731,8 +760,10 @@ function Viewer({
     return () => {
       b.dispose();
       bridge.current = null;
+      // A new frame reports its own slots.
+      setAskSlots([]);
     };
-  }, [el, src, version, onHello, onRenavigated, touch, gone]);
+  }, [el, src, version, onHello, onRenavigated, touch, gone, noteUse]);
 
   // Focus moved into the frame (a window blur with the frame active): touched.
   useEffect(() => {
@@ -1069,6 +1100,13 @@ function Viewer({
                 allow="clipboard-write"
               />
               {commentsOn && <PinBeside frame={el} />}
+              <AskSlots
+                frame={el}
+                artifactId={artifact.id}
+                reported={askSlots}
+                setSize={setAskSlotSize}
+                enabled={authed}
+              />
             </div>
           )}
           {((commentsOn && surface === "column" && columnShown && !panelOpen) ||
@@ -1095,6 +1133,7 @@ function Viewer({
                 surface === "panel" && commentsTab ? cmt.listedOpen : undefined
               }
               tab={tab}
+              usedCaps={usedCaps}
               onTab={(t) => setPanel(true, t)}
               onClose={() => setPanel(false)}
             />

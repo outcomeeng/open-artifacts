@@ -1,29 +1,44 @@
-// #1742: a restarted session (a new agent_ref) takes back its old name when
-// only one `away` reservation of a closed agent of the same kind and scope,
-// on any non-revoked machine, holds it: on agent_up and on rename. The old
-// reservation is released and mail still queued for it (never acked) moves to
-// the newcomer; acked bodies never move. Every other holder still means a
-// suffix. Time is BusHub.setTestClock, ahead of real time, reset after each
-// test.
+// #1742 / #3132: a new session (a new agent_ref) asking for the chosen name an
+// away or live session holds NEVER takes it back (#3132, Leo 2026-11-26: "the
+// name is the role"; "new session, any machine = card"). It gets the suffixed
+// session name and asks the holder for the role: a pending role proposal, and
+// nothing moves (name, role, mail, follows stay with the holder). Only the
+// same session (same agent_ref) reopening gets its name back, silently. Time
+// is BusHub.setTestClock, ahead of real time, reset after each test.
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import {
+  BUS_CAPS,
   type ClientFrame,
   MAILBOX_PENDING_CAP,
   type ServerFrame,
 } from "@oa/bus-protocol";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BusHub, OFFLINE_REAP_MS } from "../../src/bus/hub.js";
 import {
   type Daemon,
   daemon,
+  fence,
   framesSeen,
   hello,
-  hubOf,
-  machine,
+  member,
+  hubOf as memberHub,
   ns,
-  up,
+  up as plainUp,
+  machine as seedMachine,
   waitFor,
 } from "./helpers.js";
+import { eventually } from "./helpers.ts";
+
+/** #3143: only a name a person gave is a role, so these tests' sessions choose theirs. */
+const up = (...a: Parameters<typeof plainUp>): ReturnType<typeof plainUp> =>
+  ({ ...plainUp(...a), name_chosen: true }) as ClientFrame;
+
+let userId: string;
+beforeEach(async () => {
+  userId = (await member()).userId;
+});
+const machine = (label: string) => seedMachine(label, userId);
+const hubOf = () => memberHub(userId);
 
 const inHub = async <R>(fn: (i: BusHub, s: DurableObjectState) => R) =>
   runInDurableObject(await hubOf(), fn);
@@ -52,9 +67,12 @@ const base = () => Date.now() + 3_600_000 + ++seq * 1000;
 
 type Receipt = Extract<ServerFrame, { type: "receipt" }>;
 
-async function connect(token: string): Promise<Daemon> {
+async function connect(token: string, caps?: string[]): Promise<Daemon> {
   const d = await daemon(token);
-  d.send(hello(id("h")));
+  d.send({
+    ...hello(id("h")),
+    ...(caps === undefined ? {} : { caps }),
+  } as ClientFrame);
   await waitFor(d, "hello_ok");
   return d;
 }
@@ -106,6 +124,7 @@ async function rename(
     v: 1,
     id: fid,
     type: "rename",
+    name_chosen: true,
     agent_ref: ref,
     proposed_name: name,
   } as ClientFrame);
@@ -118,15 +137,13 @@ async function rename(
 
 const close = async (d: Daemon, ref: string) => {
   d.send({ v: 1, id: id("c"), type: "sessions", open: [], closed: [ref] });
-  for (let k = 0; k < 400; k++) {
+  await eventually(async () => {
     const r = await sqlOf<{ live: number }>(
       "select live from agents where native_ref = ? order by rowid desc limit 1",
       ref,
     );
-    if (r[0]?.live === 0) return;
-    await new Promise((res) => setTimeout(res, 5));
-  }
-  throw new Error("close never applied");
+    expect(r[0]?.live).toBe(0);
+  });
 };
 
 const delivers = (d: Daemon) =>
@@ -138,20 +155,53 @@ const awayRows = (name: string) =>
     name.toLowerCase(),
   ).then((r) => r.map((x) => x.ref));
 
+/** The roles a session's ref has a pending take-over ask for (#3132). */
+const asksOf = (ref: string) =>
+  sqlOf<{ name: string }>(
+    "select p.name as name from role_proposals p join agents a on a.id = p.agent_id where a.native_ref = ? and p.status = 'pending' and p.action = 'repoint'",
+    ref,
+  ).then((r) => r.map((x) => x.name));
+
 const pendingOf = (ref: string) =>
   sqlOf<{ id: string }>(
     "select r.id as id from receipts r join agents a on a.id = r.to_agent where a.native_ref = ? and r.state = 'pending' order by r.rowid",
     ref,
   ).then((r) => r.map((x) => x.id));
 
+const receiptOf = (msgId: string) =>
+  sqlOf<{ state: string; reason: string | null }>(
+    "select state, reason from receipts where id = ?",
+    msgId,
+  ).then((r) => r[0]);
+
+const waitExpired = async (d: Daemon, msgIds: string[]) => {
+  await eventually(() => {
+    const updates = framesSeen(d).flatMap((f) =>
+      f.type === "receipt_update" ? [f] : [],
+    );
+    for (const mid of msgIds) {
+      expect(
+        updates.find(
+          (u) =>
+            u.msg_id === mid &&
+            u.state === "expired" &&
+            u.reason === "recipient_closed",
+        ),
+      ).toBeDefined();
+    }
+  });
+};
+
 /** One machine `d` (the restarting harness) with a closed agent `old` away under `name`, and a sender on another machine. */
-async function scene(opts: { kind?: string; global?: boolean } = {}) {
+async function scene(
+  opts: { kind?: string; global?: boolean; oldSender?: boolean } = {},
+) {
   await setClock(base());
   const n = ns("rc");
   const dm = await machine("Work");
   const sm = await machine("Snd");
   const d = await connect(dm.token);
-  const snd = await connect(sm.token);
+  const snd = await connect(sm.token, opts.oldSender ? [] : [BUS_CAPS.mailbox]);
   const name = uniq("Lead");
   const oldRef = uniq("old");
   expect(await reg(d, oldRef, name, n, opts)).toBe(name);
@@ -165,90 +215,89 @@ const shut = (s: Scene) => {
 };
 
 describe("a restarted session takes back its own name (#1742)", () => {
-  it("agent_up: the exact name, no suffix; the away row is released", async () => {
+  it("agent_up: the away holder keeps its name; the newcomer gets a suffix and asks for the role (#3132)", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     expect(await awayRows(s.name)).toEqual([s.oldRef]);
-    expect(await reg(s.d, uniq("new"), s.name, s.n)).toBe(s.name);
-    expect(await awayRows(s.name)).toEqual([]);
+    const ref = uniq("new");
+    expect(await reg(s.d, ref, s.name, s.n)).toBe(`${s.name}-2`);
+    expect(await awayRows(s.name)).toEqual([s.oldRef]);
+    expect(await asksOf(ref)).toEqual([s.name]);
     shut(s);
   });
 
-  it("rename: a live session renamed to the old name gets it bare", async () => {
+  it("rename: a live session renamed to the away name gets a suffix and asks, nothing moves", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     const ref = uniq("new");
     const other = uniq("Other");
     expect(await reg(s.d, ref, other, s.n)).toBe(other);
     const r = await rename(s.d, ref, s.name);
-    expect(r.bus_name).toBe(s.name);
-    expect(await awayRows(s.name)).toEqual([]);
+    expect(r.bus_name).toBe(`${s.name}-2`);
+    expect(await awayRows(s.name)).toEqual([s.oldRef]);
+    expect(await asksOf(ref)).toEqual([s.name]);
     shut(s);
   });
 
-  it("a name that resolves only to the newcomer: a later send reaches it live, not a mailbox", async () => {
-    const s = await scene();
+  it("a legacy sender sees the away role as unknown", async () => {
+    const s = await scene({ oldSender: true });
     await close(s.d, s.oldRef);
     const ref = uniq("new");
     await reg(s.d, ref, s.name, s.n);
     const r = await send(s.snd, "snd", s.name, "after");
-    const dl = await waitFor(s.d, "deliver");
-    expect(dl.msg_id).toBe(r.msg_id);
-    expect(dl.to_ref).toBe(ref);
+    expect(r).toMatchObject({ state: "refused", reason: "unknown_agent" });
+    await fence(s.d);
+    expect(delivers(s.d)).toEqual([]);
+    expect(await pendingOf(ref)).toEqual([]);
     shut(s);
   });
 
-  it("agent_up: mail queued for the old row arrives at the newcomer, in order", async () => {
+  it("agent_up: mail queued for the old row stays with it; the newcomer gets none", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     const a = await send(s.snd, "snd", s.name, "first");
     const b = await send(s.snd, "snd", s.name, "second");
     expect([a.state, b.state]).toEqual(["pending", "pending"]);
     const ref = uniq("new");
-    expect(await reg(s.d, ref, s.name, s.n)).toBe(s.name);
-    const d1 = await waitFor(s.d, "deliver");
-    const d2 = await waitFor(s.d, "deliver");
-    expect([d1.msg_id, d2.msg_id]).toEqual([a.msg_id, b.msg_id]);
-    expect(d1.to_ref).toBe(ref);
-    expect("body" in d1 && d1.body).toBe("first");
-    expect(await pendingOf(s.oldRef)).toEqual([]);
+    expect(await reg(s.d, ref, s.name, s.n)).toBe(`${s.name}-2`);
+    await fence(s.d);
+    expect(delivers(s.d)).toEqual([]);
+    expect(await pendingOf(s.oldRef)).toEqual([a.msg_id, b.msg_id]);
+    expect(await pendingOf(ref)).toEqual([]);
     shut(s);
   });
 
-  it("rename: mail queued for the old row arrives at the live newcomer", async () => {
+  it("rename: mail queued for the old row stays with it", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     const a = await send(s.snd, "snd", s.name, "queued");
     const ref = uniq("new");
     await reg(s.d, ref, uniq("Other"), s.n);
     await rename(s.d, ref, s.name);
-    const dl = await waitFor(s.d, "deliver");
-    expect(dl.msg_id).toBe(a.msg_id);
-    expect(dl.to_ref).toBe(ref);
+    await fence(s.d);
+    expect(delivers(s.d)).toEqual([]);
+    expect(await pendingOf(s.oldRef)).toEqual([a.msg_id]);
     shut(s);
   });
 
-  it("acked bodies never move: the newcomer cannot fetch an old acked notice, and gets only the unacked mail", async () => {
+  it("acked bodies stay with the old row: the newcomer cannot fetch an old acked notice, and gets none of the unacked mail", async () => {
     const s = await scene();
     const big = "z".repeat(40_000);
     const acked = await send(s.snd, "snd", s.name, big);
     const dl = await waitFor(s.d, "deliver");
     expect(dl.msg_id).toBe(acked.msg_id);
     s.d.send({ v: 1, id: id("ak"), type: "ack", msg_id: acked.msg_id });
-    for (let k = 0; k < 400; k++) {
+    await eventually(async () => {
       const st = await sqlOf<{ state: string }>(
         "select state from receipts where id = ?",
         acked.msg_id,
       );
-      if (st[0]?.state === "delivered") break;
-      await new Promise((res) => setTimeout(res, 5));
-    }
+      expect(st[0]?.state).toBe("delivered");
+    });
     await close(s.d, s.oldRef);
     const queued = await send(s.snd, "snd", s.name, "unacked");
     const ref = uniq("new");
-    expect(await reg(s.d, ref, s.name, s.n)).toBe(s.name);
-    const d2 = await waitFor(s.d, "deliver");
-    expect(d2.msg_id).toBe(queued.msg_id);
+    expect(await reg(s.d, ref, s.name, s.n)).toBe(`${s.name}-2`);
     s.d.send({
       v: 1,
       id: "fz",
@@ -259,13 +308,7 @@ describe("a restarted session takes back its own name (#1742)", () => {
     const e = await waitFor(s.d, "error");
     expect(e.id).toBe("fz");
     expect(e.code).toBe("not_found");
-    expect(
-      await sqlOf<{ n: number }>(
-        "select count(*) as n from mail where id = ?",
-        acked.msg_id,
-      ),
-    ).toEqual([{ n: 0 }]);
-    // Nothing of the acked one was re-pointed.
+    expect(await pendingOf(s.oldRef)).toEqual([queued.msg_id]);
     expect(
       await sqlOf<{ a: string }>(
         "select a.native_ref as a from receipts r join agents a on a.id = r.to_agent where r.id = ?",
@@ -275,59 +318,31 @@ describe("a restarted session takes back its own name (#1742)", () => {
     shut(s);
   });
 
-  it("moved mail honours the newcomer's mailbox cap: the oldest fit, the rest stays with the old row", async () => {
-    const s = await scene();
-    await close(s.d, s.oldRef);
-    const sent: string[] = [];
-    for (const t of ["m1", "m2", "m3"])
-      sent.push((await send(s.snd, "snd", s.name, t)).msg_id);
-    const ref = uniq("new");
-    await reg(s.d, ref, uniq("Other"), s.n);
-    // The newcomer already holds all but two of its pending slots, below its
-    // session boundary (negative rowids never collide).
-    const have = MAILBOX_PENDING_CAP - 2;
-    for (let k = 1; k <= have; k++)
-      await sqlRun(
-        `insert into receipts (rowid, id, org_id, namespace, to_agent, to_name, from_agent, from_name, state, size, created_at, expires_at)
-         select ?, ?, org_id, namespace, id, name, id, name, 'pending', 1, 0, 9e15 from agents where native_ref = ?`,
-        -k,
-        `filler${seq}-${k}`,
-        ref,
-      );
-    await rename(s.d, ref, s.name);
-    const dl1 = await waitFor(s.d, "deliver");
-    const dl2 = await waitFor(s.d, "deliver");
-    expect([dl1.msg_id, dl2.msg_id]).toEqual([sent[0], sent[1]]);
-    expect(await pendingOf(s.oldRef)).toEqual([sent[2]]);
-    await sqlRun("delete from receipts where id like ?", `filler${seq}-%`);
-    shut(s);
-  });
-
-  it("a rename loop gains nothing: away and back never duplicates or re-takes mail", async () => {
+  it("a rename loop asks once: away and back never files a second proposal or moves mail", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     const a = await send(s.snd, "snd", s.name, "once");
     const ref = uniq("new");
     await reg(s.d, ref, uniq("Other"), s.n);
     await rename(s.d, ref, s.name);
-    await waitFor(s.d, "deliver");
     const away = uniq("Away");
     await rename(s.d, ref, away);
-    expect((await rename(s.d, ref, s.name)).bus_name).toBe(s.name);
-    expect(await pendingOf(ref)).toEqual([a.msg_id]);
-    expect(await pendingOf(s.oldRef)).toEqual([]);
-    // Names the loop left are not away rows of anyone.
-    expect(await awayRows(s.name)).toEqual([]);
+    expect((await rename(s.d, ref, s.name)).bus_name).toBe(`${s.name}-2`);
+    expect(await asksOf(ref)).toEqual([s.name]);
+    expect(await pendingOf(ref)).toEqual([]);
+    expect(await pendingOf(s.oldRef)).toEqual([a.msg_id]);
+    expect(await awayRows(s.name)).toEqual([s.oldRef]);
     shut(s);
   });
 
-  it("the old session coming back later gets a suffix and none of the mail", async () => {
+  it("the old session coming back later (same ref) gets its own name bare, silently, and its mail", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
-    await send(s.snd, "snd", s.name, "for the new one");
+    const q = await send(s.snd, "snd", s.name, "for the old one");
     await reg(s.d, uniq("new"), s.name, s.n);
-    await waitFor(s.d, "deliver");
-    expect(await reg(s.d, s.oldRef, s.name, s.n)).toBe(`${s.name}-2`);
+    expect(await reg(s.d, s.oldRef, s.name, s.n)).toBe(s.name);
+    const dl = await waitFor(s.d, "deliver");
+    expect(dl).toMatchObject({ msg_id: q.msg_id, to_ref: s.oldRef });
     shut(s);
   });
 
@@ -338,18 +353,19 @@ describe("a restarted session takes back its own name (#1742)", () => {
     shut(s);
   });
 
-  it("an away holder on another machine is reclaimed too, with its queued mail", async () => {
+  it("an away holder on another machine is asked too, and keeps its queued mail", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     const q = await send(s.snd, "snd", s.name, "for the restart");
     const om = await machine("Other");
     const o = await connect(om.token);
     const ref = uniq("new");
-    expect(await reg(o, ref, s.name, s.n)).toBe(s.name);
-    const dl = await waitFor(o, "deliver");
-    expect(dl.msg_id).toBe(q.msg_id);
-    expect(dl.to_ref).toBe(ref);
-    expect(await awayRows(s.name)).toEqual([]);
+    expect(await reg(o, ref, s.name, s.n)).toBe(`${s.name}-2`);
+    await fence(o);
+    expect(delivers(o)).toEqual([]);
+    expect(await pendingOf(s.oldRef)).toEqual([q.msg_id]);
+    expect(await awayRows(s.name)).toEqual([s.oldRef]);
+    expect(await asksOf(ref)).toEqual([s.name]);
     o.close();
     shut(s);
   });
@@ -424,8 +440,7 @@ describe("a restarted session takes back its own name (#1742)", () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     await sqlRun(
-      "insert into roles (id, org_id, namespace, name, lname, agent_id, set_at) select ?, org_id, namespace, name, lower(name), null, 0 from agents where native_ref = ?",
-      id("role"),
+      "update roles set agent_id = null where agent_id = (select id from agents where native_ref = ?)",
       s.oldRef,
     );
     expect(await reg(s.d, uniq("new"), s.name, s.n)).toBe(`${s.name}-2`);
@@ -487,14 +502,14 @@ describe("a restarted session takes back its own name (#1742)", () => {
     shut(s);
   });
 
-  it("a full restart: every agent of a machine goes away with its socket, then the same chosen names come back bare, by agent_up and by rename, each with its own mail", async () => {
+  it("a full restart: every agent of a machine goes away with its socket; new sessions asking the same chosen names, by agent_up and by rename, get suffixes and ask, mail stays with each holder", async () => {
     const t0 = base();
     await setClock(t0);
     const n = ns("rc");
     const dm = await machine("Work");
     const sm = await machine("Snd");
     const d = await connect(dm.token);
-    const snd = await connect(sm.token);
+    const snd = await connect(sm.token, [BUS_CAPS.mailbox]);
     await reg(snd, "snd", uniq("Snd"), n);
     const names = [uniq("Lead"), uniq("Back"), uniq("Front")];
     const oldRefs = names.map(() => uniq("old"));
@@ -503,14 +518,13 @@ describe("a restarted session takes back its own name (#1742)", () => {
     // The machine goes offline; the hub reaps its agents into `away`.
     d.close();
     await d.closed;
-    for (let k = 0; k < 400; k++) {
+    await eventually(async () => {
       const r = await sqlOf<{ t: number | null }>(
         "select disconnected_at as t from machines where id = ?",
         dm.id,
       );
-      if (typeof r[0]?.t === "number") break;
-      await new Promise((res) => setTimeout(res, 5));
-    }
+      expect(typeof r[0]?.t).toBe("number");
+    });
     await setClock(t0 + OFFLINE_REAP_MS);
     await inHub(async (_, st) => {
       if ((await st.storage.getAlarm()) === null)
@@ -527,40 +541,43 @@ describe("a restarted session takes back its own name (#1742)", () => {
     const refs = names.map(() => uniq("new"));
     // 0 and 2 by agent_up, 1 by a rename from another name.
     expect(await reg(d2, refs[0] as string, names[0] as string, n)).toBe(
-      names[0],
+      `${names[0]}-2`,
     );
     expect(await reg(d2, refs[2] as string, names[2] as string, n)).toBe(
-      names[2],
+      `${names[2]}-2`,
     );
     expect(await reg(d2, refs[1] as string, uniq("Tmp"), n)).not.toBe(names[1]);
     expect(
       (await rename(d2, refs[1] as string, names[1] as string)).bus_name,
-    ).toBe(names[1]);
-    // reg() skips frames it does not wait for: read every deliver received.
-    for (let k = 0; k < 400 && delivers(d2).length < 3; k++)
-      await new Promise((res) => setTimeout(res, 5));
-    const got = new Map(delivers(d2).map((x) => [x.msg_id, x.to_ref]));
+    ).toBe(`${names[1]}-2`);
+    await fence(d2);
+    expect(delivers(d2)).toEqual([]);
     for (const [msgId, name] of mail)
-      expect(got.get(msgId)).toBe(refs[names.indexOf(name)]);
-    for (const name of names) expect(await awayRows(name)).toEqual([]);
+      expect(await pendingOf(oldRefs[names.indexOf(name)] as string)).toEqual([
+        msgId,
+      ]);
+    for (const [i, name] of names.entries()) {
+      expect(await awayRows(name)).toEqual([oldRefs[i]]);
+      expect(await asksOf(refs[i] as string)).toEqual([name]);
+    }
     d2.close();
     snd.close();
   });
 
-  it("a machine move: the name and the queued mail go to the new machine; the old session returning gets a suffix and no mail", async () => {
+  it("a machine move: a new session on the new machine asks and gets a suffix; the old session returning keeps the name and its mail", async () => {
     const s = await scene();
     await close(s.d, s.oldRef);
     const q = await send(s.snd, "snd", s.name, "queued on A");
     const bm = await machine("B");
     const b = await connect(bm.token);
     const ref = uniq("onB");
-    expect(await reg(b, ref, s.name, s.n)).toBe(s.name);
-    const dl = await waitFor(b, "deliver");
-    expect(dl).toMatchObject({ msg_id: q.msg_id, to_ref: ref });
-    // A's old session comes back.
-    expect(await reg(s.d, s.oldRef, s.name, s.n)).toBe(`${s.name}-2`);
-    await new Promise((res) => setTimeout(res, 50));
-    expect(s.d.raw.some((t) => t.includes('"deliver"'))).toBe(false);
+    expect(await reg(b, ref, s.name, s.n)).toBe(`${s.name}-2`);
+    await fence(b);
+    expect(delivers(b)).toEqual([]);
+    // A's old session comes back: the same session, silently its own name.
+    expect(await reg(s.d, s.oldRef, s.name, s.n)).toBe(s.name);
+    const dl = await waitFor(s.d, "deliver");
+    expect(dl).toMatchObject({ msg_id: q.msg_id, to_ref: s.oldRef });
     b.close();
     shut(s);
   });
@@ -582,7 +599,7 @@ describe("a restarted session takes back its own name (#1742)", () => {
     shut(s);
   });
 
-  it("acked notice bodies left past the close batch are gone after the name is taken, and none is fetchable by the newcomer", async () => {
+  it("acked notice bodies left past the close batch stay with the holder: none is fetchable by the newcomer", async () => {
     const s = await scene();
     const big = "z".repeat(40_000);
     // More than CLOSE_INLINE_BATCH (10): the close leaves bodies for its drain.
@@ -593,24 +610,16 @@ describe("a restarted session takes back its own name (#1742)", () => {
       await waitFor(s.d, "deliver");
       s.d.send({ v: 1, id: `ak${k}`, type: "ack", msg_id: r.msg_id });
     }
-    for (let k = 0; k < 400; k++) {
+    await eventually(async () => {
       const st = await sqlOf<{ n: number }>(
         "select count(*) as n from receipts where state = 'delivered' and id in (select value from json_each(?))",
         JSON.stringify(ids),
       );
-      if (st[0]?.n === 12) break;
-      await new Promise((res) => setTimeout(res, 5));
-    }
+      expect(st[0]?.n).toBe(12);
+    });
     await close(s.d, s.oldRef);
-    const left = () =>
-      sqlOf<{ n: number }>(
-        "select count(*) as n from mail where id in (select value from json_each(?))",
-        JSON.stringify(ids),
-      );
-    expect((await left())[0]?.n).toBeGreaterThan(0);
     const ref = uniq("new");
-    expect(await reg(s.d, ref, s.name, s.n)).toBe(s.name);
-    expect((await left())[0]?.n).toBe(0);
+    expect(await reg(s.d, ref, s.name, s.n)).toBe(`${s.name}-2`);
     for (const [k, mid] of ids.entries()) {
       s.d.send({
         v: 1,
@@ -632,6 +641,7 @@ describe("a restarted session takes back its own name (#1742)", () => {
     ["pi", "pi"],
     ["omp", "omp"],
     ["openclaw", "openclaw"],
+    ["antigravity", "antigravity"],
     ["hermes", "hermes"],
     ["hermes", "hermes-myproject"],
     ["claude-code", "agent"],
@@ -652,55 +662,36 @@ describe("a restarted session takes back its own name (#1742)", () => {
       const ref2 = uniq("new2");
       await reg(s.d, ref2, uniq("Other"), s.n, { kind });
       expect((await rename(s.d, ref2, fallback)).bus_name).not.toBe(fallback);
-      await new Promise((res) => setTimeout(res, 50));
+      await fence(s.d);
       expect(delivers(s.d)).toEqual([]);
       expect(await awayRows(fallback)).toContain(oldRef);
       expect(await pendingOf(oldRef)).toEqual([q.msg_id]);
       shut(s);
     });
 
-  it("a named session of a harness kind still reclaims its name", async () => {
+  it("a named session of a harness kind asks for its name too, and gets a suffix", async () => {
     const s = await scene();
     const name = uniq("Review");
     const oldRef = uniq("old");
     expect(await reg(s.d, oldRef, name, s.n, { kind: "codex" })).toBe(name);
     await close(s.d, oldRef);
-    expect(await reg(s.d, uniq("new"), name, s.n, { kind: "codex" })).toBe(
-      name,
-    );
+    const ref = uniq("new");
+    expect(await reg(s.d, ref, name, s.n, { kind: "codex" })).toBe(`${name}-2`);
+    expect(await asksOf(ref)).toEqual([name]);
     shut(s);
   });
 
-  it("a pushed, unacked body follows the name: the newcomer gets it under the same msg_id and its ack settles", async () => {
+  it("a pushed, unacked body stays with the holder: the newcomer gets nothing, the old session coming back gets it", async () => {
     const s = await scene();
     const r = await send(s.snd, "snd", s.name, "pushed, never acked");
     await waitFor(s.d, "deliver");
     await close(s.d, s.oldRef);
     const ref = uniq("new");
-    expect(await reg(s.d, ref, s.name, s.n)).toBe(s.name);
-    for (
-      let k = 0;
-      k < 400 && !delivers(s.d).some((x) => x.to_ref === ref);
-      k++
-    )
-      await new Promise((res) => setTimeout(res, 5));
-    const dl = delivers(s.d).find((x) => x.to_ref === ref);
-    expect(dl).toMatchObject({ msg_id: r.msg_id });
-    expect(dl && "body" in dl && dl.body).toBe("pushed, never acked");
-    s.d.send({ v: 1, id: id("ak"), type: "ack", msg_id: r.msg_id });
-    for (let k = 0; k < 400; k++) {
-      const st = await sqlOf<{ state: string; ref: string }>(
-        "select r.state as state, a.native_ref as ref from receipts r join agents a on a.id = r.to_agent where r.id = ?",
-        r.msg_id,
-      );
-      if (st[0]?.state === "delivered") {
-        expect(st[0].ref).toBe(ref);
-        shut(s);
-        return;
-      }
-      await new Promise((res) => setTimeout(res, 5));
-    }
-    throw new Error("ack never settled");
+    expect(await reg(s.d, ref, s.name, s.n)).toBe(`${s.name}-2`);
+    await fence(s.d);
+    expect(delivers(s.d).some((x) => x.to_ref === ref)).toBe(false);
+    expect(await pendingOf(s.oldRef)).toEqual([r.msg_id]);
+    shut(s);
   });
 
   it("#1480: a name with parentheses is cleaned; a restart gets a suffix, never the old address", async () => {
@@ -746,19 +737,23 @@ describe("a restarted session takes back its own name (#1742)", () => {
     shut(s);
   });
 
-  it("#1480: a trailing space or doubled spaces still reclaim (#1742 unchanged)", async () => {
+  it("#1480: a trailing space or doubled spaces still mean the same held name: a suffix and an ask (#3132)", async () => {
     const s = await scene();
     const name = uniq("Two Words");
     const old = uniq("old2");
     await reg(s.d, old, name, s.n);
     await close(s.d, old);
-    expect(await reg(s.d, uniq("sp"), `${name} `, s.n)).toBe(name);
+    const sp = uniq("sp");
+    expect(await reg(s.d, sp, `${name} `, s.n)).toBe(`${name}-2`);
+    expect(await asksOf(sp)).toEqual([name]);
     const name2 = uniq("Two Words");
     const old2 = uniq("old3");
     await reg(s.d, old2, name2, s.n);
     await close(s.d, old2);
     const dbl = name2.replace(" ", "  ");
-    expect(await reg(s.d, uniq("dbl"), dbl, s.n)).toBe(name2);
+    const dref = uniq("dbl");
+    expect(await reg(s.d, dref, dbl, s.n)).toBe(`${name2}-2`);
+    expect(await asksOf(dref)).toEqual([name2]);
     shut(s);
   });
 
@@ -776,5 +771,218 @@ describe("a restarted session takes back its own name (#1742)", () => {
       await sqlOf("select 1 from agents where lower(name) = 'tidy 3-2'"),
     ).toEqual([]);
     shut(s);
+  });
+});
+
+describe("held mail stays with its session (#3208)", () => {
+  it("an agy row that closes without a handover keeps its mail: a new agy session gets agy-2 and none of it, and the row's own reopen receives it", async () => {
+    await setClock(base());
+    const n = ns("rc");
+    const dm = await machine("Work");
+    const sm = await machine("Snd");
+    const d = await connect(dm.token, [BUS_CAPS.mailbox]);
+    const snd = await connect(sm.token, [BUS_CAPS.mailbox]);
+    const oldRef = uniq("agy-starting-1");
+    expect(await reg(d, oldRef, "agy", n, { kind: "antigravity" })).toBe("agy");
+    await reg(snd, "snd", uniq("Snd"), n);
+    const m1 = await send(snd, "snd", "agy", "first");
+    const m2 = await send(snd, "snd", "agy", "second");
+    await close(d, oldRef);
+    const newRef = uniq("agy-starting-2");
+    const got = await reg(d, newRef, "agy", n, { kind: "antigravity" });
+    expect(got).toBe("agy-2");
+    expect(delivers(d).filter((x) => x.to_ref === newRef)).toEqual([]);
+    expect(await pendingOf(newRef)).toEqual([]);
+    expect(await pendingOf(oldRef)).toEqual([m1.msg_id, m2.msg_id]);
+    expect((await receiptOf(m1.msg_id))?.state).toBe("pending");
+    await reg(d, oldRef, "agy", n, { kind: "antigravity" });
+    await eventually(() => {
+      const ids = delivers(d)
+        .filter((x) => x.to_ref === oldRef)
+        .map((x) => x.msg_id);
+      expect(ids).toContain(m1.msg_id);
+      expect(ids).toContain(m2.msg_id);
+    });
+    d.close();
+    snd.close();
+  });
+
+  it("a chosen-name restart with no handover: the newcomer gets a suffix and asks; the held mail stays (#3132)", async () => {
+    await setClock(base());
+    const n = ns("rc");
+    const dm = await machine("Work");
+    const sm = await machine("Snd");
+    const d = await connect(dm.token, [BUS_CAPS.mailbox]);
+    const snd = await connect(sm.token, [BUS_CAPS.mailbox]);
+    const name = uniq("Lead");
+    const oldRef = uniq("codex-1");
+    expect(await reg(d, oldRef, name, n, { kind: "codex" })).toBe(name);
+    await reg(snd, "snd", uniq("Snd"), n);
+    const m = await send(snd, "snd", name, "for the old lead");
+    await close(d, oldRef);
+    const newRef = uniq("codex-2");
+    expect(await reg(d, newRef, name, n, { kind: "codex" })).toBe(`${name}-2`);
+    expect(await asksOf(newRef)).toEqual([name]);
+    await fence(d);
+    expect(
+      delivers(d).some((x) => x.to_ref === newRef && x.msg_id === m.msg_id),
+    ).toBe(false);
+    expect(await pendingOf(oldRef)).toEqual([m.msg_id]);
+    expect((await receiptOf(m.msg_id))?.state).not.toBe("expired");
+    d.close();
+    snd.close();
+  });
+
+  it("an explicit handover (replaces) keeps the mail and the successor receives it", async () => {
+    await setClock(base());
+    const n = ns("rc");
+    const dm = await machine("Work");
+    const sm = await machine("Snd");
+    const d = await connect(dm.token, [BUS_CAPS.mailbox]);
+    const snd = await connect(sm.token, [BUS_CAPS.mailbox]);
+    const oldRef = uniq("agy-starting-3");
+    expect(await reg(d, oldRef, "agy", n, { kind: "antigravity" })).toBe("agy");
+    await reg(snd, "snd", uniq("Snd"), n);
+    const m = await send(snd, "snd", "agy", "during startup");
+    const newRef = uniq("conv-uuid-3");
+    d.send({
+      ...up(id("u"), newRef, "agy", n),
+      kind: "antigravity",
+      replaces: oldRef,
+    } as ClientFrame);
+    expect((await waitFor(d, "agent_ok")).bus_name).toBe("agy");
+    await eventually(() => {
+      const dl = delivers(d).find(
+        (x) => x.to_ref === newRef && x.msg_id === m.msg_id,
+      );
+      expect(dl).toBeDefined();
+    });
+    expect((await receiptOf(m.msg_id))?.state).not.toBe("expired");
+    d.close();
+    snd.close();
+  });
+
+  it("Claude /clear still carries mail for a roleless session", async () => {
+    await setClock(base());
+    const n = ns("rc");
+    const dm = await machine("Work");
+    const sm = await machine("Snd");
+    const d = await connect(dm.token, [BUS_CAPS.mailbox]);
+    const snd = await connect(sm.token, [BUS_CAPS.mailbox]);
+    const name = uniq("Lead");
+    const oldRef = uniq("claude-1");
+    d.send({
+      ...plainUp(id("u"), oldRef, name, n),
+      kind: "claude-code",
+    } as ClientFrame);
+    expect((await waitFor(d, "agent_ok")).bus_name).toBe(name);
+    await reg(snd, "snd", uniq("Snd"), n);
+    const m = await send(snd, "snd", name, "before clear");
+    const newRef = uniq("claude-2");
+    d.send({
+      ...up(id("u"), newRef, name, n),
+      kind: "claude-code",
+      replaces: oldRef,
+    } as ClientFrame);
+    expect((await waitFor(d, "agent_ok")).bus_name).toBe(name);
+    await eventually(() => {
+      const dl = delivers(d).find(
+        (x) => x.to_ref === newRef && x.msg_id === m.msg_id,
+      );
+      expect(dl).toBeDefined();
+    });
+    expect((await receiptOf(m.msg_id))?.state).not.toBe("expired");
+    d.close();
+    snd.close();
+  });
+
+  it("a starting agy row whose process ended (gone): its mail expires at once as recipient_closed, the sender is told, and a new agy session gets none", async () => {
+    await setClock(base());
+    const n = ns("rc");
+    const dm = await machine("Work");
+    const sm = await machine("Snd");
+    const d = await connect(dm.token, [
+      BUS_CAPS.mailbox,
+      BUS_CAPS.sessionsGone,
+    ]);
+    const snd = await connect(sm.token, [
+      BUS_CAPS.mailbox,
+      BUS_CAPS.sessionsGone,
+    ]);
+    const oldRef = uniq("agy-starting-9");
+    expect(await reg(d, oldRef, "agy", n, { kind: "antigravity" })).toBe("agy");
+    await reg(snd, "snd", uniq("Snd"), n);
+    const m = await send(snd, "snd", "agy", "during startup");
+    d.send({
+      v: 1,
+      id: id("c"),
+      type: "sessions",
+      open: [],
+      closed: [oldRef],
+      gone: [oldRef],
+    });
+    await waitExpired(snd, [m.msg_id]);
+    expect(await receiptOf(m.msg_id)).toEqual({
+      state: "expired",
+      reason: "recipient_closed",
+    });
+    expect(await awayRows("agy")).not.toContain(oldRef);
+    const newRef = uniq("agy-starting-10");
+    expect(await reg(d, newRef, "agy", n, { kind: "antigravity" })).toBe("agy");
+    expect(delivers(d).filter((x) => x.to_ref === newRef)).toEqual([]);
+    expect(await pendingOf(newRef)).toEqual([]);
+    d.close();
+    snd.close();
+  });
+
+  it("a plain close (no gone) keeps the mail for the reopen", async () => {
+    await setClock(base());
+    const n = ns("rc");
+    const dm = await machine("Work");
+    const sm = await machine("Snd");
+    const d = await connect(dm.token, [
+      BUS_CAPS.mailbox,
+      BUS_CAPS.sessionsGone,
+    ]);
+    const snd = await connect(sm.token, [
+      BUS_CAPS.mailbox,
+      BUS_CAPS.sessionsGone,
+    ]);
+    const oldRef = uniq("agy-starting-11");
+    expect(await reg(d, oldRef, "agy", n, { kind: "antigravity" })).toBe("agy");
+    await reg(snd, "snd", uniq("Snd"), n);
+    const m = await send(snd, "snd", "agy", "keep for reopen");
+    await close(d, oldRef);
+    expect((await receiptOf(m.msg_id))?.state).toBe("pending");
+    await reg(d, oldRef, "agy", n, { kind: "antigravity" });
+    await eventually(() => {
+      const dl = delivers(d).find(
+        (x) => x.to_ref === oldRef && x.msg_id === m.msg_id,
+      );
+      expect(dl).toBeDefined();
+    });
+    d.close();
+    snd.close();
+  });
+
+  it("gone that is not in closed is refused", async () => {
+    await setClock(base());
+    const dm = await machine("Work");
+    const d = await connect(dm.token, [
+      BUS_CAPS.mailbox,
+      BUS_CAPS.sessionsGone,
+    ]);
+    const fid = id("c");
+    d.send({
+      v: 1,
+      id: fid,
+      type: "sessions",
+      open: [],
+      closed: [],
+      gone: [uniq("agy-starting-12")],
+    } as ClientFrame);
+    const err = await waitFor(d, "error");
+    expect(err).toMatchObject({ id: fid, code: "bad_frame" });
+    d.close();
   });
 });

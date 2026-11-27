@@ -1,6 +1,8 @@
 import {
+  AGY_CHECK_HEADER,
   BUS_CAPS,
   type ClientFrame,
+  CODEX_VERDICT_HEADER,
   decodeServerFrame,
   encodeFrame,
   frameId,
@@ -18,7 +20,7 @@ export type HubOptions = {
   label: string;
   version: string;
   /** Read on every open; sent as `sessions` right after `hello`. */
-  sessions: () => { open: string[]; closed: string[] };
+  sessions: () => { open: string[]; closed: string[]; gone?: string[] };
   onFrame: (frame: ServerFrame) => void;
   /** A frame the decoder rejected but whose id it recovered: it answers that request. */
   onBadFrame?: (id: string, error: "bad_frame" | "too_large") => void;
@@ -60,6 +62,9 @@ export const HUB_HELLO_CAPS = [
   BUS_CAPS.noticeMeta,
   BUS_CAPS.ownerAway,
   BUS_CAPS.guest,
+  BUS_CAPS.mailExpiry,
+  BUS_CAPS.sessionsGone,
+  BUS_CAPS.codexCheck,
 ] as const;
 
 export class HubConnection {
@@ -163,7 +168,11 @@ export class HubConnection {
     if (this.#stopped) return;
     const pingMs = this.opts.pingMs ?? 25_000;
     const ws = new WebSocket(this.opts.url, {
-      headers: { authorization: `Bearer ${this.opts.token}` },
+      headers: {
+        [AGY_CHECK_HEADER]: "1",
+        authorization: `Bearer ${this.opts.token}`,
+        [CODEX_VERDICT_HEADER]: "1",
+      },
       handshakeTimeout: this.opts.handshakeTimeoutMs ?? 15_000,
     });
     this.#ws = ws;

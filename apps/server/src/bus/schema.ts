@@ -215,6 +215,48 @@ create table if not exists roles (
 );
 create index if not exists roles_lname on roles(org_id, lname);
 
+-- A legacy ask may identify its author only by address. Keep the last Free
+-- for that address across role deletion, name reuse and hub restarts.
+create table if not exists freed_role_names (
+  namespace text not null,
+  lname text not null,
+  freed_at integer not null,
+  primary key (namespace, lname)
+);
+
+-- #3132 role moves: a role re-pointed from one session to another
+-- (putRole). The from-session's address and identity are kept as they were,
+-- since its agents row may be gone, so a notice still sent there (an ask's
+-- answer, a mention, a follow) reaches the role's current holder
+-- (roleForward), for what it began while it held the role: held_from (the
+-- role's held_since then) to at. A name reclaim (#1816) is not a move: nothing follows a
+-- name by itself. A new table: create-if-not-exists adds it; wipe() deletes it.
+create table if not exists role_moves (
+  id text primary key,
+  org_id text not null,
+  role_id text not null,
+  from_agent_id text not null,
+  from_ns text not null,
+  from_lname text not null,
+  from_identity text,
+  to_agent_id text not null,
+  held_from integer not null,
+  at integer not null
+);
+create index if not exists role_moves_from on role_moves(org_id, from_ns, from_lname);
+create index if not exists role_moves_identity on role_moves(org_id, from_identity);
+
+-- #3132 a role's pages that its holder also follows for itself: one follow
+-- row (D1 follows, one per address and page) serves both, so the role's part
+-- is kept here, and the role's next move gives the page to the new holder
+-- while the old one keeps its own follow. A new table: create-if-not-exists
+-- adds it; wipe() deletes it.
+create table if not exists role_follows (
+  role_id text not null,
+  artifact_id text not null,
+  primary key (role_id, artifact_id)
+);
+
 -- #1372 role proposals: a role change an AI agent proposed over MCP
 -- (bus_role_propose). Nothing changes until the member confirms it in a
 -- browser on its link; token_hash is the sha256 of that link's secret (the
@@ -464,6 +506,52 @@ export function migrateHub(sql: SqlStorage, now: number = Date.now()): void {
   ] as const)
     if (!agentCols.has(col))
       sql.exec(`alter table agents add column ${col} ${type}`);
+  // #3132: when the role's current holder started holding it (set_at also
+  // moves on a rename). Backfill: set_at.
+  const roleCols = new Set(
+    sql
+      .exec<{ name: string }>("select name from pragma_table_info('roles')")
+      .toArray()
+      .map((r) => r.name),
+  );
+  if (!roleCols.has("held_since")) {
+    sql.exec("alter table roles add column held_since integer");
+    sql.exec("update roles set held_since = set_at");
+  }
+  // #3132: who moved a role (member: a browser or API write; holder: the
+  // holding session handed it over) and whether its bus.role.moved audit row
+  // is written. A move is recorded unaudited and settled once D1 has the row;
+  // a failed write keeps the request's credential here and is retried
+  // (services/bus.ts auditRoleMoves). Rows from before these columns were
+  // audited best effort and count as done.
+  const moveCols = new Set(
+    sql
+      .exec<{ name: string }>(
+        "select name from pragma_table_info('role_moves')",
+      )
+      .toArray()
+      .map((r) => r.name),
+  );
+  if (!moveCols.has("from_machine_label")) {
+    sql.exec("alter table role_moves add column from_machine_label text");
+    sql.exec(`update role_moves set from_machine_label = (
+      select m.label from agents a join machines m on m.id = a.machine_id
+      where a.id = role_moves.from_agent_id)`);
+  }
+  for (const [col, type] of [
+    ["personal_route", "text"],
+    ["route_retired_at", "integer"],
+    ["retired_from_name", "integer not null default 0"],
+    ["moved_by", "text not null default 'member'"],
+    ["audited", "integer not null default 1"],
+    ["cred_kind", "text"],
+    ["cred_id", "text"],
+  ] as const)
+    if (!moveCols.has(col))
+      sql.exec(`alter table role_moves add column ${col} ${type}`);
+  sql.exec(
+    "create index if not exists role_moves_unaudited on role_moves(at) where audited = 0",
+  );
   // #1822: the session link. identity_id is opaque and random, minted at the
   // first accepted link_bind; proof_hash is the sha256 of the session's
   // current proof, null unless the session is live and bound.
@@ -597,6 +685,20 @@ export function migrateHub(sql: SqlStorage, now: number = Date.now()): void {
   // agent uses its machine's disconnected_at), null while open or after a
   // revoke. Its pending mail expires at away_since + MAILBOX_RETAIN_MS at
   // the latest. Add-only.
+  if (!agentCols.has("takeover_role_id")) {
+    sql.exec("alter table agents add column takeover_role_id text");
+    sql.exec("alter table agents add column takeover_route text");
+    // Existing accepted proposals still identify both the role and its recipient.
+    sql.exec(`update agents set (takeover_role_id, takeover_route) = (
+      select p.role_id, p.agent_name from role_proposals p join roles r on r.id = p.role_id
+      where p.org_id = agents.org_id and p.agent_id = agents.id and r.agent_id = agents.id
+        and p.action = 'repoint' and p.status = 'applied' and p.agent_name = agents.name
+        and lower(p.prior_holder_name) = p.lname
+        and substr(lower(p.agent_name), 1, length(p.lname) + 1) = p.lname || '-'
+        and cast(substr(p.agent_name, length(p.lname) + 2) as integer) >= 2
+        and cast(cast(substr(p.agent_name, length(p.lname) + 2) as integer) as text) = substr(p.agent_name, length(p.lname) + 2)
+      order by p.decided_at desc limit 1)`);
+  }
   if (!agentCols.has("away_since"))
     sql.exec("alter table agents add column away_since integer");
   // #2311: 1 once the name was set by a `rename` of kind chosen (a user or a
