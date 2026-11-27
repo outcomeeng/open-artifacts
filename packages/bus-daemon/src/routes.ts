@@ -10,6 +10,7 @@ import {
 } from "@oa/bus-ipc";
 import {
   AGENT_CAP_MESSAGES,
+  BRIEF_RULES,
   type ClientFrame,
   ClientFrameSchema,
   frameId,
@@ -17,6 +18,7 @@ import {
 } from "@oa/bus-protocol";
 import type { z } from "zod";
 import type { AgentTable } from "./agents.ts";
+import { UNMAPPED_FOLDER_MESSAGE } from "./folders.ts";
 import type { HubConnection } from "./hub.ts";
 import { REACH_COPY, type ReachResult } from "./reach.ts";
 import type { Timer } from "./sent.ts";
@@ -69,6 +71,8 @@ export class Pending {
     private readonly onTimeout?: (hubId: string) => Unframed | undefined,
     /** The clock for the timeout; tests bring a fake one. */
     private readonly after: Timer = unrefTimer,
+    /** Called after an entry leaves the map. */
+    private readonly onChange?: () => void,
   ) {}
 
   open(localId: string, reply: (f: DaemonFrame) => unknown): string {
@@ -165,6 +169,7 @@ export class Pending {
     if (!w) return undefined;
     this.#byHubId.delete(hubId);
     w.stop();
+    this.onChange?.();
     return w;
   }
 }
@@ -224,8 +229,15 @@ export type RouteCtx = {
    * hello'd connection. True when a live record took it.
    */
   linked?: (ref: string, hash: string) => boolean;
+  /**
+   * #3043: the habits a session is told at start: the one short text the bus
+   * pushes, or null when this install opted out. Without it, the bundled text
+   * answers (a daemon too old to know the opt-out).
+   */
+  habits?: () => string | null;
   /** rename (#1635): the session's new name, from an adapter that listed the cap. */
-  renamed?: (ref: string, name: string) => void;
+  renamed?: (ref: string, name: string, chosen: boolean) => void;
+  unmapped?: (cwd: string) => boolean;
   /** Config files refused or noted on this agent's folder chain, plus the allowlist, for `self` with `row` (#1527). */
   configFiles?: (cwd: string, pending?: boolean) => ConfigFile[];
   /**
@@ -309,6 +321,14 @@ export function routeLocal(
 
   switch (frame.type) {
     case "self": {
+      const unmapped =
+        agent.instance === undefined && ctx.unmapped?.(agent.cwd);
+      if (frame.row && unmapped)
+        return {
+          type: "error",
+          code: "hub_unavailable",
+          message: UNMAPPED_FOLDER_MESSAGE,
+        };
       const files = frame.row
         ? (ctx.configFiles?.(
             agent.cwd,
@@ -329,7 +349,7 @@ export function routeLocal(
             ? { namespace_source: agent.namespaceSource }
             : {}),
           kind: agent.kind,
-          live: agent.live,
+          live: agent.live && !unmapped,
           global: agent.global,
           ...(files.length > 0 ? { config_files: files } : {}),
           ...(away === undefined ? {} : { owner_away_until: away }),
@@ -368,7 +388,11 @@ export function routeLocal(
           code: "bad_frame",
           message: "rename is not supported on this connection",
         };
-      ctx.renamed(ref, frame.name);
+      ctx.renamed(
+        ref,
+        frame.name,
+        hello.kind === "pi" && frame.name_chosen === true,
+      );
       return undefined;
     case "link_proof":
       // Bound to the connection's own agent: the frame names none. An adapter
@@ -380,6 +404,11 @@ export function routeLocal(
           message: "link_proof is not supported on this connection",
         };
       return { type: "link_proofed", bound: ctx.linked(ref, frame.hash) };
+    case "habits": {
+      // Not `??`: null is the opt-out's answer, not a missing one.
+      const rules = ctx.habits ? ctx.habits() : BRIEF_RULES;
+      return { type: "habits", rules };
+    }
     case "set_status": {
       const cap = ctx.limited?.(ref);
       if (cap)

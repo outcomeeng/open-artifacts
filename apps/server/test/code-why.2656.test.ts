@@ -53,15 +53,6 @@ describe("codeEligibility says why not", () => {
       "row_inactive",
     ],
     [
-      "a Google-linked row",
-      async () => {
-        const a = uniq("lk", "x.com");
-        await seedUser(a, "guest", { googleSub: `L-${a}` });
-        return [direct(), a];
-      },
-      "linked",
-    ],
-    [
       "an expired invite",
       async () => {
         const a = uniq("ex", "a.com");
@@ -89,20 +80,54 @@ describe("codeEligibility says why not", () => {
       "domain_no_join",
     ],
     [
-      "a member row outside the domains",
-      async () => {
-        const a = uniq("mem", "x.com");
-        await seedUser(a, "member");
-        return [direct(), a];
-      },
-      "not_guest",
-    ],
-    [
       "an address nobody shared with",
       async () => [direct(), uniq("nobody", "x.com")],
       "no_share",
     ],
   ])("%s", async (_n, setup, expected) => {
+    const [e, email] = await setup();
+    expect(await why(e, email)).toBe(expected);
+  });
+
+  // #3184: every active row gets a code at its exact address, its own role.
+  it.each<[string, () => Promise<[Env, string]>, "member" | "guest"]>([
+    [
+      "a Google-linked guest row",
+      async () => {
+        const a = uniq("lk", "x.com");
+        await seedUser(a, "guest", { googleSub: `L-${a}` });
+        return [direct(), a];
+      },
+      "guest",
+    ],
+    [
+      "an admin row outside the domains",
+      async () => {
+        const a = uniq("adm", "x.com");
+        await seedUser(a, "admin");
+        return [direct(), a];
+      },
+      "member",
+    ],
+    [
+      "a member row outside the domains on an install without Google",
+      async () => {
+        const a = uniq("mem", "x.com");
+        await seedUser(a, "member");
+        return [trial(), a];
+      },
+      "member",
+    ],
+    [
+      "a member row in the domains while domain codes are off",
+      async () => {
+        const a = uniq("dmem", "a.com");
+        await seedUser(a, "member");
+        return [direct(), a];
+      },
+      "member",
+    ],
+  ])("eligible: %s", async (_n, setup, expected) => {
     const [e, email] = await setup();
     expect(await why(e, email)).toBe(expected);
   });

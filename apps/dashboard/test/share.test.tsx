@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import { HttpResponse, http } from "msw";
 import { describe, expect, it, vi } from "vitest";
+import { installClock } from "./clock";
 import {
   installHarness,
   mount,
@@ -19,16 +20,22 @@ import {
   wait,
 } from "./harness";
 
+/** #3037: the bridge's capability reporter, as the frame's calls would reach it. */
+const capReporters: ((cap: string) => void)[] = [];
 vi.mock("../src/viewer/bridge", () => ({
-  createBridge: () => ({
-    dispose: vi.fn(),
-    requestThumbnail: vi.fn(),
-    setTheme: vi.fn(),
-    setArtifact: vi.fn(),
-  }),
+  createBridge: (o: { onCapability?: (cap: string) => void }) => {
+    if (o.onCapability) capReporters.push(o.onCapability);
+    return {
+      dispose: vi.fn(),
+      requestThumbnail: vi.fn(),
+      setTheme: vi.fn(),
+      setArtifact: vi.fn(),
+    };
+  },
 }));
 
 installHarness();
+installClock();
 
 const id = (title: string) =>
   (fixtures.artifacts.find((a) => a.title === title) as { id: string }).id;
@@ -132,11 +139,7 @@ describe("share panel", () => {
     );
   });
 
-  it.each([
-    // #2590: only an old Editor share on a guest keeps the caption; a
-    // viewer or commenter guest's picker says Can view or Can comment.
-    ["editor", "Editor", "Guest · can only view for now"],
-  ])(
+  it.each([["editor", "Editor", "Editor once they join the team"]])(
     "a guest's row with stored %s: email, caption, then the select and Remove",
     async (role, shown, caption) => {
       const guest = "gus@elsewhere.test";
@@ -163,14 +166,13 @@ describe("share panel", () => {
         name: `Role for ${guest}`,
       });
       expect(select).toHaveTextContent(shown);
-      const remove = screen.getByRole("button", { name: `Remove ${guest}` });
+
       const follows = (a: Element, b: Element) =>
         a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING;
       expect(follows(label, select)).toBeTruthy();
-      expect(follows(select, remove)).toBeTruthy();
+
       expect(label.parentElement).not.toBe(email.parentElement);
       expect(label.parentElement).toContainElement(select);
-      expect(label.parentElement).toContainElement(remove);
     },
   );
 
@@ -196,9 +198,6 @@ describe("share panel", () => {
       });
       expect(select).toHaveTextContent("Editor");
       expect(caption.parentElement).toContainElement(select);
-      expect(caption.parentElement).toContainElement(
-        screen.getByRole("button", { name: "Remove dan@example.com" }),
-      );
       // #2509: "Restricted" now names the general access; the row itself has no restricted chip.
       expect(email.closest("li")).not.toHaveTextContent(/restrict/i);
     });
@@ -221,7 +220,7 @@ describe("share panel", () => {
       ]);
       mount(panel(OWNED));
       expect(
-        await screen.findByText("Guest · can only view for now"),
+        await screen.findByText("Editor once they join the team"),
       ).toBeTruthy();
       expect(screen.queryByText(NOW)).toBeNull();
     });
@@ -308,12 +307,12 @@ describe("share panel", () => {
       mountHosted(panel(OWNED), CODES, undefined, guestRows);
       await screen.findByTitle(who);
       expect(
-        await screen.findByText("Guest · can only view for now"),
+        await screen.findByText("Editor once they join the team"),
       ).toBeTruthy();
       expect(screen.queryByText(LINE)).toBeNull();
     });
 
-    it("an unknown address is outside (Can comment / Can view); a known member as Editor gets no line", async () => {
+    it("a new address and a known member both default to Editor", async () => {
       mountHosted(panel(OWNED), CODES);
       await screen.findByRole("combobox", { name: "Invite role" });
       fireEvent.change(screen.getByLabelText("Email"), {
@@ -322,7 +321,7 @@ describe("share panel", () => {
       await waitFor(() =>
         expect(
           screen.getByRole("combobox", { name: "Invite role" }),
-        ).toHaveTextContent("Can comment"),
+        ).toHaveTextContent("Editor"),
       );
       fireEvent.change(screen.getByLabelText("Email"), {
         target: { value: "" },
@@ -344,12 +343,79 @@ describe("share panel", () => {
         screen.getByRole("combobox", { name: "Role for bob@example.com" }),
       ).toHaveTextContent("Editor"),
     );
+    fireEvent.keyDown(trigger, { key: "Enter" });
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove bob@example.com" }),
+      await screen.findByRole("option", { name: "Remove access" }),
     );
     await waitFor(() =>
       expect(screen.queryByText("bob@example.com")).toBeNull(),
     );
+  });
+
+  it("#3037: marks the live data boxes this page's code uses", async () => {
+    capReporters.length = 0;
+    // The caps are stated here: earlier tests may have patched the fixture.
+    const art = fixtures.artifacts.find((a) => a.id === OWNED);
+    server.use(
+      http.get(`*${R.artifact(OWNED)}`, () =>
+        HttpResponse.json({
+          ...art,
+          capabilities: { db: true, viewer: true, storage: true },
+        }),
+      ),
+    );
+    mount(panel(OWNED));
+    await screen.findByRole("checkbox", { name: "Database" });
+    // Nothing called yet: every box says so.
+    expect(screen.getAllByText("Not used yet on this visit.")).toHaveLength(3);
+    await act(async () => {
+      capReporters.at(-1)?.("db");
+    });
+    expect(screen.getAllByText("This page uses it.")).toHaveLength(1);
+    expect(screen.getAllByText("Not used yet on this visit.")).toHaveLength(2);
+    // The box is on: a plain mark, not a warning.
+    expect(screen.queryByText(/asked for it/)).toBeNull();
+  });
+
+  it("#3037: an off box the page asked for reports it in plain ink, never urging", async () => {
+    capReporters.length = 0;
+    const art = fixtures.artifacts.find((a) => a.id === OWNED);
+    server.use(
+      http.get(`*${R.artifact(OWNED)}`, () =>
+        HttpResponse.json({
+          ...art,
+          capabilities: { db: false, viewer: false, storage: false },
+        }),
+      ),
+    );
+    mount(panel(OWNED));
+    await screen.findByRole("checkbox", { name: "Database" });
+    await act(async () => {
+      capReporters.at(-1)?.("db");
+    });
+    expect(
+      screen.getByText("This page asked for it. It's off."),
+    ).toBeInTheDocument();
+    // Viewer identity names what turning it on would hand the page.
+    await act(async () => {
+      capReporters.at(-1)?.("viewer");
+    });
+    expect(
+      screen.getByText(
+        "This page asked for it. It's off. Turning it on shows this page each viewer's name and email.",
+      ),
+    ).toBeInTheDocument();
+    // A page can forge these calls, so the mark never takes the warning tone
+    // (#3037 review: it should not push the owner into widening access).
+    for (const el of screen.getAllByText(/asked for it/))
+      expect(el.className).toBe("oa-muted");
+  });
+
+  it("#3037: a markdown artifact has no usage marks (only a page's code can call them)", async () => {
+    capReporters.length = 0;
+    mount(panel(id("Meeting notes")));
+    await screen.findByRole("checkbox", { name: "Database" });
+    expect(screen.queryByText(/This page (uses|doesn't use) it/)).toBeNull();
   });
 
   it("each Live data checkbox has its hint as its accessible description", async () => {
@@ -803,9 +869,11 @@ describe("one request per action (useSingleFlight)", () => {
   it("two Remove clicks in one tick send one DELETE", async () => {
     const dels = count("DELETE");
     mount(panel(OWNED));
-    const remove = await screen.findByRole("button", {
-      name: /^Remove .+@/,
+    const trigger = await screen.findByRole("combobox", {
+      name: "Role for bob@example.com",
     });
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    const remove = await screen.findByRole("option", { name: "Remove access" });
     act(() => {
       fireEvent.click(remove);
       fireEvent.click(remove);

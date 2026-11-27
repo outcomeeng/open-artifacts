@@ -1,4 +1,4 @@
-import { normalizeEmail } from "@oa/auth-core";
+import { inDomains, normalizeEmail } from "@oa/auth-core";
 import {
   AUTH,
   CODE_POLICY,
@@ -616,20 +616,32 @@ export function mountCodes(app: AppType): void {
     }
 
     const row = elig.userId ? await getUserWithEpoch(c.env, elig.userId) : null;
-    if (!row) return unauthorized({ reason: "expired" }, [clearPending(c)]);
+    // #3184 exact address: the row the session is signed for must still be
+    // at the mailbox just verified (its address may change between reads).
+    if (!row || row.user.email.toLowerCase() !== email)
+      return unauthorized({ reason: "expired" }, [clearPending(c)]);
     const user: Member = row.user;
     const guest = elig.kind === "guest";
     const domain = email.slice(email.lastIndexOf("@") + 1);
+    // A domain-code sign-in (domain codes on: trial, Google off) keeps its
+    // tenant, as before. Any other owner, admin or member row (#3184: outside
+    // the domains, or on an install without domain codes): no tenant, the m
+    // marker instead; the middleware rechecks the row on every request.
+    const domainCode =
+      !guest && cfg.domainCodes && inDomains(cfg.domains, domain);
+    const rowCode = !guest && !domainCode;
+    const tenant = domainCode ? domain : undefined;
     const maxAgeS = guest ? GUEST_MAX_AGE_S : undefined;
     const signedAt = Date.now();
     const sess = await signSession(c.env, user.id, signedAt, {
       provider: "code",
-      tenant: guest ? undefined : domain,
+      tenant,
       epoch: row.sessionEpoch,
       maxAgeS,
       // The forced re-auth marker (#1372): a code sign-in is itself one, since
       // every code is new, emailed and typed by the person; no silent path.
       authAt: signedAt,
+      rowCode,
     });
     // The sign-in and its auth.signin audit row commit together; the last
     // statement reads the member's hosted fields (restriction included).
@@ -640,7 +652,7 @@ export function mountCodes(app: AppType): void {
         Date.now(),
         user.id,
       ),
-      signInAudit(c.env, user.id, "code", guest ? undefined : domain),
+      signInAudit(c.env, user.id, "code", tenant),
       stmt(c.env.DB, HOSTED_FIELDS).bind(user.id),
     ]);
     // #2632: a member's own Welcome, once (the email code path too); never throws.
@@ -649,7 +661,7 @@ export function mountCodes(app: AppType): void {
       provider: "code",
       outcome: "ok",
       uid: user.id,
-      tenant: guest ? undefined : domain,
+      tenant,
     });
     // As the session's next request will see it (middleware; GET /me's
     // auth.cap): the member's own cap (guest, or restricted by the manual

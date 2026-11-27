@@ -1,13 +1,15 @@
-export { BUS_CMD, LINK_PROOF_HEADER } from "@oa/bus-protocol";
+export { BRIEF_RULES, BUS_CMD, LINK_PROOF_HEADER } from "@oa/bus-protocol";
 export {
   connectDaemon,
   type DaemonClient,
   DaemonSilentError,
+  daemonHabits,
   daemonLinkProof,
   daemonStatus,
   HelloRefused,
 } from "./client.ts";
 export {
+  AWAY_RECENT_MS,
   cleanStatusLabel,
   collapsedAwayLine,
   correctedDeliveredText,
@@ -20,6 +22,7 @@ export {
   fitName,
   followingText,
   followText,
+  hiddenAwayLine,
   lateDeliveredText,
   linkedLiveNamespace,
   messageHeader,
@@ -45,6 +48,7 @@ export {
   unfollowText,
 } from "./copy.ts";
 export * from "./frames.ts";
+export { habitsOff } from "./habits-off.ts";
 export { FrameTooLarge, LineDecoder } from "./lines.ts";
 export {
   type HelloResult,

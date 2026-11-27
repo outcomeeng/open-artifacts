@@ -208,4 +208,12 @@ export type SessionPayload = {
    * sign-in: P3 T18's break-glass. Not Google's auth_time (#2470).
    */
   a?: number;
+  /**
+   * 1 on a code session of an owner, admin or member row (no `t`; #3082 set
+   * it for invited members only, #3184 for every non-guest row, same value).
+   * The server lifts the code session's guest cap for it only while the row
+   * is still active and not a guest and the install still offers codes,
+   * checked every request; otherwise the session is refused.
+   */
+  m?: 1;
 };

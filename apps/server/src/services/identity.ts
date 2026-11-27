@@ -299,12 +299,12 @@ const admitted = (user: Member | null): AdmitResult =>
 /**
  * Why a code isn't allowed, for the log only (#2656): a fixed word, never the
  * address. bad_address: not an address. row_inactive: the row is removed or
- * suspended. linked: the row has a Google link. invite_expired: a never-signed-in
- * invite past its window. domain_codes_off / domain_no_join: the address is in
- * the login domains, where codes are off or a new address can't join. not_guest:
- * a member or admin row outside the domains (they never sign in by code).
- * no_share: no row and no live share. outsider_off: the owner's outside-sharing
- * switch is off.
+ * suspended. linked: (link codes only, linkEligibility) the row already has a
+ * Google link. invite_expired: a never-signed-in invite past its window.
+ * domain_codes_off / domain_no_join: an address in the login domains with no
+ * row (or a guest row there), where codes are off or a new address can't join.
+ * no_share: no row and no live share. outsider_off: the owner's
+ * outside-sharing switch is off.
  */
 export type CodeWhy =
   | "bad_address"
@@ -313,7 +313,6 @@ export type CodeWhy =
   | "invite_expired"
   | "domain_codes_off"
   | "domain_no_join"
-  | "not_guest"
   | "no_share"
   | "outsider_off";
 
@@ -332,13 +331,14 @@ const SHARED = `select 1 as x from shares s join artifacts a on a.id = s.artifac
   where s.email = ?1 and a.deleted_at is null limit 1`;
 
 /**
- * Who may get an emailed code (no writes; checked at request and at verify):
- * - never a user with a Google link, nor a removed or suspended row;
+ * Who may get an emailed code (no writes; checked at request and at verify),
+ * #3184: every active row at its exact address keeps its own role (owner,
+ * admin, member; a Google link doesn't matter), on any install with codes on,
+ * unless its invite lapsed. Guest rows and addresses with no row as before:
  * - in a verified domain: only while domain codes are on (trial, Google
- *   off): an existing row keeps its role, a new address joins as member if
+ *   off): a guest row keeps its role, a new address joins as member if
  *   join = member;
- * - outside the domains: only invited guests (a guest row, or a share and no
- *   row); owner, admin and member rows there never sign in by code.
+ * - outside the domains: a guest row, or a share and no row, as a guest.
  */
 export async function codeEligibility(
   env: Env,
@@ -409,6 +409,7 @@ export type CodeRow = {
   id: string | null;
   role: Role;
   status: string;
+  /** Read for linkEligibility; codeRule ignores it (#3184). */
   linked: number | boolean;
 };
 
@@ -426,7 +427,11 @@ export async function codeRule(
 ): Promise<CodeEligibility> {
   if (row && row.status !== "active")
     return { kind: "none", why: "row_inactive" };
-  if (row?.linked) return { kind: "none", why: "linked" };
+  // #3184: a code proves the mailbox of the row's exact address, so any
+  // owner, admin or member row signs in by code as itself, linked or not,
+  // in the domains or out, Google on or off.
+  if (row && !isGuestRole(row.role))
+    return { kind: "member", userId: row.id, role: row.role };
   const domain = email.slice(email.lastIndexOf("@") + 1);
   if (inDomains(cfg.domains, domain)) {
     if (!cfg.domainCodes) return { kind: "none", why: "domain_codes_off" };
@@ -435,10 +440,7 @@ export async function codeRule(
       ? { kind: "member", userId: null, role: "member" }
       : { kind: "none", why: "domain_no_join" };
   }
-  if (row)
-    return isGuestRole(row.role)
-      ? { kind: "guest", userId: row.id }
-      : { kind: "none", why: "not_guest" };
+  if (row) return { kind: "guest", userId: row.id };
   return (await shared())
     ? { kind: "guest", userId: null }
     : { kind: "none", why: "no_share" };

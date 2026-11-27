@@ -1,7 +1,6 @@
 // O1: self-host runs RECOVERY_CRON every 2 min on Workers Free (10 ms of CPU
-// per invocation). An idle tick off the daily slot is the windowed lost index
-// and thumbnail sweep: two indexed D1 reads (cron.recovery.test.ts counts
-// them). Its wall time in local workerd, D1 I/O included, stays well under
+// per invocation). An idle tick off the daily slot runs the recovery sweep and the fan-out
+// drain (cron.recovery.test.ts counts their D1 statements). Its wall time in local workerd, D1 I/O included, stays well under
 // 10 ms: reported, asserted under test:cpu:strict (budget(),
 // docs/ops/cpu-budget.md). Runs serially via vitest.cpu.config.ts.
 import { env } from "cloudflare:workers";
@@ -32,8 +31,7 @@ describe("RECOVERY_CRON idle tick CPU", () => {
       } as unknown as ExecutionContext;
       await scheduled({ cron: RECOVERY_CRON, scheduledTime: NOON }, e, ctx);
       await Promise.all(pending);
-      // The sweep and the run-version fan-out drain (#2719): no daily work
-      // registered.
+      // Sweep and fan-out, outside the daily slot.
       expect(pending).toHaveLength(2);
     };
     const ms = await medianMs(idle);

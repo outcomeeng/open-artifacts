@@ -19,7 +19,8 @@ export type HarnessName =
   | "omp"
   | "codex"
   | "hermes"
-  | "openclaw";
+  | "openclaw"
+  | "antigravity";
 export const HARNESS_LABEL: Record<HarnessName, string> = {
   claude: "Claude Code",
   opencode: "OpenCode",
@@ -28,6 +29,7 @@ export const HARNESS_LABEL: Record<HarnessName, string> = {
   codex: "Codex",
   hermes: "Hermes",
   openclaw: "OpenClaw",
+  antigravity: "Antigravity",
 };
 /** The dashboard's labels for AGENT_KINDS. */
 export const KIND_LABEL: Record<AgentKind, string> = {
@@ -38,6 +40,7 @@ export const KIND_LABEL: Record<AgentKind, string> = {
   hermes: "Hermes",
   openclaw: "OpenClaw",
   codex: "Codex",
+  antigravity: "Antigravity",
 };
 /** A known kind's label; any other kind shows as its own token (C26h). */
 export const kindLabel = (kind: string): string =>
@@ -593,7 +596,7 @@ export function copy(
       "  install      --instance <url>   the instance to connect to",
       "               --check            only report what is set up; change nothing",
       "               --habits | --no-habits | --show-habits",
-      "                                  add, decline or show the always-on habit lines",
+      "                                  turn the rules the bus sends to sessions on or off, or show them",
       "               --no-service       skip the launchd or systemd step",
       "               --alongside        with --home <dir>: set up a separate bus next to your main one,",
       "                                  and leave every harness setting alone. To use a second",
@@ -804,6 +807,79 @@ export function copy(
       fail(`${HARNESS_LABEL[h]} is not wired`),
       next(`Run ${bus} to wire it.`),
     ],
+    // Doctor, when agy's MCP config can't be read: install skips it.
+    agyMalformed: (file: string) => [
+      fail(`Antigravity is not wired: ${clip(file, 33)} isn't valid JSON`),
+      next(`Fix that file, then run ${bus} again.`),
+    ],
+    // agy S5, doctor: an Open Artifacts entry in agy's config goes through the proxy.
+    agyPagesLinked: (name: string, host: string, instance?: string) =>
+      done(
+        `Antigravity's ${clip(name, 32)} entry goes through oa-bus (${clip(host, 40)}${instance ? `, instance ${instance}` : ""})`,
+      ),
+    // agy S5, doctor: install would put that entry through the proxy.
+    agyPagesPending: (name: string) => [
+      warn(
+        `Antigravity's ${clip(name, 32)} entry doesn't show pages as the session yet`,
+      ),
+      next(
+        `Run ${bus} with OA_BUS_EXPERIMENTAL_AGY=1, then start a new agy session.`,
+      ),
+    ],
+    // agy S5, doctor: install leaves that entry as it is; the note says why and the fix.
+    agyPagesLeft: (note: string) => [
+      warn(
+        "An Antigravity Open Artifacts entry doesn't show pages as the session",
+      ),
+      next(note),
+    ],
+    // agy S5, doctor: the proxy's program is gone (oa-bus moved or removed).
+    agyPagesMissing: (name: string, program: string) => [
+      fail(
+        `Antigravity's ${clip(name, 32)} entry runs ${clip(program, 40)}, which is gone, so its tools fail`,
+      ),
+      next(`Run ${bus} again to point it at this oa-bus.`),
+    ],
+    // Doctor, when ~/.gemini/config/plugins/oa-bus is a folder install didn't make.
+    agyPluginForeign: (dir: string) => [
+      fail(`Antigravity is not wired: ${clip(dir, 33)} isn't oa-bus's`),
+      next(`Move that folder away, then run ${bus} again.`),
+    ],
+    // Doctor, when agy has the oa-bus plugin switched off.
+    agyPluginOff: () => [
+      warn("Antigravity has the oa-bus plugin turned off"),
+      next("Turn it on with: agy plugin enable oa-bus"),
+    ],
+    // agy S3, doctor: the one rule that lets a session start its watcher without asking.
+    agyRulePresent: () =>
+      done("Antigravity may start the bus watcher without asking"),
+    agyToolsMissing: (rules: string[]) => [
+      warn(
+        `Antigravity bus tool grants missing or restricted: ${rules.join(", ")}`,
+      ),
+      next(
+        `Run ${bus} to restore missing grants. Review any explicit ask or deny entries in Antigravity settings.`,
+      ),
+    ],
+    agyRuleMissing: () => [
+      warn("Antigravity will ask before it starts the bus watcher"),
+      next(
+        `Run ${bus} to save the one rule that lets it start without asking.`,
+      ),
+    ],
+    agyRuleAltered: (file: string) => [
+      warn(
+        `Antigravity's rule for the bus watcher was changed in ${clip(file, 33)}`,
+      ),
+      next(
+        `Run ${bus} to put it back, and remove any other rule that names agy-watch.`,
+      ),
+    ],
+    // Doctor, when our entry is in agy's config but turned off there.
+    agyDisabled: () => [
+      warn("Antigravity has the bus turned off"),
+      next("Turn it on with: agy mcp enable oa_bus"),
+    ],
     claudeAccepts: () =>
       done("Claude Code accepts messages from other machines"),
     claudeIsolates: (settings: string) => [
@@ -812,6 +888,14 @@ export function copy(
     ],
     // Codex's checks, after its wiring line (C26e).
     codexWakes: (bin: string) => done(`Codex wakes with ${clip(bin, 20)}`),
+    // #3108: a Codex entry that signs in by itself, linked through the server check.
+    codexLinked: (name: string, ago: string) =>
+      done(`Codex's ${clip(name, 50)} entry is linked (last call ${ago}).`),
+    codexLinksOnFirstCall: (name: string) =>
+      p(
+        "muted",
+        `Codex's ${clip(name, 50)} entry links on its first Open Artifacts call.`,
+      ),
     // The Claude Code plugins (#2095). Drafts for OA Product: wording is theirs.
     outputStyleOn: () => [
       done("Turned on the Artifacts Teammate output style"),
@@ -1153,7 +1237,7 @@ export function copy(
     updateOff: () =>
       `Auto-update is off. Turn it on with ${bus} auto-update on.`,
     updateFailedVersion: (v: string) =>
-      `${v} failed on this machine before, so it won't be installed. The next version will be.`,
+      `${v} failed its last check. The bus will retry automatically.`,
     updatePrompt: (v: string) =>
       `Install ${v} now? The bus restarts for a few seconds. Type yes to continue: `,
     updateDeclined: () => "Nothing was installed.",

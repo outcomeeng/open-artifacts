@@ -22,6 +22,7 @@ import {
   it,
   vi,
 } from "vitest";
+import { installClock, settle } from "./clock";
 import { calls, installHarness, mount, server } from "./harness";
 import { FIRST_LOAD_MS } from "./timeouts";
 
@@ -123,6 +124,9 @@ const box = async () => {
 const type = (b: HTMLElement, value: string) =>
   fireEvent.change(b, { target: { value, selectionStart: value.length } });
 
+// A clock, not the wall (test/clock.ts).
+installClock();
+
 describe("@ lists people with the agents (#2770)", () => {
   it("searches by what is typed and lists agents and people together", async () => {
     const qs: string[] = [];
@@ -187,7 +191,9 @@ describe("@ lists people with the agents (#2770)", () => {
   it("picks with the keyboard, shows a pill, and sends the id in people", async () => {
     serve();
     server.use(
-      http.post(CAND, () => HttpResponse.json({ items: [DANA, DANIELLE] })),
+      http.post(CAND, () =>
+        HttpResponse.json({ items: [DANA, { ...DANIELLE, handle: "dan-o" }] }),
+      ),
     );
     const all = calls("POST");
     // The candidates search is a POST too: only comments count here.
@@ -210,21 +216,24 @@ describe("@ lists people with the agents (#2770)", () => {
       expect(within(c).getAllByRole("option")).toHaveLength(2),
     );
     expect(b.getAttribute("aria-activedescendant")).toMatch(/-0$/);
+    expect(within(c).getAllByRole("option")[1]).toHaveTextContent(
+      "Danielle Okafor @dan-o",
+    );
     fireEvent.keyDown(b, { key: "ArrowDown" });
     fireEvent.keyDown(b, { key: "Enter" });
-    expect((b as HTMLTextAreaElement).value).toBe("@Danielle Okafor ");
+    expect((b as HTMLTextAreaElement).value).toBe("@dan-o ");
     expect(
       within(c).getByRole("button", {
-        name: "Remove mention of Danielle Okafor",
+        name: "Remove mention of dan-o",
       }),
     ).toBeTruthy();
-    expect(within(c).getByText("Will notify Danielle Okafor")).toBeTruthy();
+    expect(within(c).getByText("Will notify dan-o")).toBeTruthy();
     expect(within(c).queryByRole("listbox")).toBeNull();
-    type(b, "@Danielle Okafor can you check?");
+    type(b, "@dan-o can you check?");
     fireEvent.click(within(c).getByRole("button", { name: "Comment" }));
     await waitFor(() => expect(posts.length).toBeGreaterThan(0));
     expect(posts[0]?.body).toMatchObject({
-      body: "@Danielle Okafor can you check?",
+      body: "@dan-o can you check?",
       people: ["usr_danielle"],
     });
     expect(posts[0]?.body).not.toHaveProperty("mentions");
@@ -284,7 +293,7 @@ describe("@ lists people with the agents (#2770)", () => {
     const { c, b } = await box();
     type(b, "@s");
     // Past the debounce, so the slow request is on its way.
-    await act(() => new Promise((r) => setTimeout(r, 250)));
+    await settle(250);
     type(b, "@da");
     await waitFor(() =>
       expect(within(c).getAllByRole("option")[0]?.textContent).toContain(
@@ -293,7 +302,7 @@ describe("@ lists people with the agents (#2770)", () => {
     );
     await act(async () => {
       release();
-      await new Promise((r) => setTimeout(r, 50));
+      await settle(50);
     });
     const rows = within(c).getAllByRole("option");
     expect(rows).toHaveLength(1);
@@ -346,7 +355,7 @@ describe("@ lists people with the agents (#2770)", () => {
     mount(viewerPath(OWNED));
     const { c, b } = await box();
     type(b, "@da");
-    await act(() => new Promise((r) => setTimeout(r, 300)));
+    await settle(300);
     expect(within(c).queryByText("Dana Whitfield")).toBeNull();
   });
 });

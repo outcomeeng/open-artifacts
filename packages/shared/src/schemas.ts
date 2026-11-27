@@ -19,6 +19,7 @@ import {
 import { isId } from "./ids.js";
 import { INLINE_TOO_LARGE_MESSAGE, LIMITS } from "./limits.js";
 import { findCaseCollision, normalizePath } from "./paths.js";
+import { PersonHandleSchema } from "./person-handle.js";
 import { utf8Exceeds } from "./utf8.js";
 import {
   PRESENCE_ACTIVITY_MAX,
@@ -75,13 +76,14 @@ export function resolveDataWriters(
 }
 export const RoleSchema = z.enum(["owner", "admin", "member", "guest"]);
 export type Role = z.infer<typeof RoleSchema>;
-/**
- * A share's role. "commenter" opens the page like a viewer and adds comments
- * and replies for a guest (a guest with "viewer" cannot comment); for a
- * member it reads as "viewer".
- */
+/** Viewer reads, Commenter may also comment, and Editor may publish versions. */
 export const ShareRoleSchema = z.enum(["viewer", "commenter", "editor"]);
 export type ShareRole = z.infer<typeof ShareRoleSchema>;
+
+/** Names used in the sharing menu, title bar and email. */
+export function shareRoleLabel(role: ShareRole): string {
+  return { viewer: "Viewer", commenter: "Commenter", editor: "Editor" }[role];
+}
 /**
  * The caller's level on one artifact. "owner": the personal owner only;
  * "manager": a space manager on a shared-space artifact (same actions as owner
@@ -390,6 +392,8 @@ export const ArtifactSummarySchema = z.object({
   space: SpaceRefSchema.optional(),
   /** Hosted M1: what the caller may do (artifactCan). Optional: absent unless spaces are on. */
   can: ArtifactCanSchema.optional(),
+  /** The signed-in recipient’s directly assigned page role. */
+  shareRole: ShareRoleSchema.optional(),
   /** #682: the Comments setting (on by default). Absent: the server has no comments (older than #1496), so the shell shows none. */
   comments: z.boolean().optional(),
   /** #2080: who may post when comments are on. Absent: older server, read as "everyone". */
@@ -763,7 +767,7 @@ export type MemberPatch = z.infer<typeof MemberPatchSchema>;
 
 export const ShareInputSchema = z.strictObject({
   email: z.string().email(),
-  /** Absent: "commenter" for a guest, "viewer" for anyone else. */
+  /** Absent: Editor. A guest assigned Editor can only view until joining as a member. */
   role: ShareRoleSchema.optional(),
 });
 export type ShareInput = z.infer<typeof ShareInputSchema>;
@@ -910,6 +914,7 @@ export const MeSchema = z.object({
     .optional(),
   /** The name the user chose (PATCH R.me), or null. */
   displayName: z.string().nullable(),
+  handle: z.string().nullable().optional(),
   /** The IdP's name for the user when it is a real name (not the email's local part), else null. */
   suggestedName: z.string().nullable(),
   /** No chosen name and no usable IdP name: ask the user for one. */
@@ -988,11 +993,12 @@ export const DisplayNameSchema = z
 export const MePatchSchema = z
   .strictObject({
     displayName: DisplayNameSchema.optional(),
+    handle: PersonHandleSchema.optional(),
     commentEmail: z.boolean().optional(),
   })
   .refine(
-    (p) => p.displayName !== undefined || p.commentEmail !== undefined,
-    "Send displayName or commentEmail",
+    (p) => Object.keys(p).length > 0,
+    "Send displayName, handle or commentEmail",
   );
 export type MePatch = z.infer<typeof MePatchSchema>;
 
@@ -1088,6 +1094,7 @@ export type OAuthClient = z.infer<typeof OAuthClientSchema>;
  * asked in time (unknown), never true once revoked.
  */
 export const BusMachineSchema = z.strictObject({
+  busVersion: z.string().nullable().optional(),
   id: z.string(),
   /** Client-supplied at the device step; not editable in v1. */
   label: z.string(),
@@ -1100,6 +1107,7 @@ export type BusMachine = z.infer<typeof BusMachineSchema>;
 
 /** GET R.busMachines: active newest first, then revoked newest first, at most 100. */
 export const BusMachinesSchema = z.strictObject({
+  instanceVersion: z.string().optional(),
   machines: z.array(BusMachineSchema).max(100),
   /**
    * #2552: whether the owner paused every instance-driven machine update.
@@ -1132,6 +1140,8 @@ export const BusAgentSchema = z.strictObject({
   namespace: z.string(),
   name: z.string(),
   kind: z.string(),
+  /** The app the kind runs ("Claude Code", "Antigravity"); absent when the server doesn't know the kind. */
+  product: z.string().max(80).optional(),
   machineId: z.string(),
   machineLabel: z.string(),
   global: z.boolean(),
@@ -1144,8 +1154,31 @@ export const BusAgentSchema = z.strictObject({
   statusAt: z.string().optional(),
   /** #2311: still on a harness default name (never renamed); present only when true. */
   unnamed: z.boolean().optional(),
+  /** #3132: the role it holds in its own namespace: the address to @-mention it by. */
+  role: z.string().optional(),
+  roleId: z.string().optional(),
+  /** #3132: it handed its role on and holds none: the @ list leaves it out (its mail follows the role). */
+  handedOver: z.boolean().optional(),
+  /** #3132: the role it asked to take over, while that waits: the @ list leaves it out (no "-2"). */
+  privateSessionName: z.boolean().optional(),
+  pendingRole: z.string().optional(),
 });
 export type BusAgent = z.infer<typeof BusAgentSchema>;
+
+/**
+ * agy S2b: an Antigravity session the bus found running before its first
+ * message. The daemon marks it with this status label (state `idle`); it is
+ * the bus's word, not the agent's. Same value as bus-protocol's
+ * AGY_STARTING_LABEL.
+ */
+export const BUS_STARTING_LABEL = "starting";
+export const busAgentStarting = (
+  a: Pick<BusAgent, "kind" | "state" | "status" | "statusLabel">,
+): boolean =>
+  a.kind === "antigravity" &&
+  a.state === "live" &&
+  a.status === "idle" &&
+  a.statusLabel === BUS_STARTING_LABEL;
 
 /**
  * GET R.busAgents. `live` is false when the bus could not be asked (off, unbound, timeout): agents is then [].
@@ -1249,9 +1282,9 @@ export const TeammatesSchema = z.strictObject({
 });
 export type Teammates = z.infer<typeof TeammatesSchema>;
 
-/** PUT R.onboarding: a flag only turns on (true), never off. */
+/** PUT R.onboarding: `completed` only turns on (true); `dismissed` also turns off (false: the hidden checklist comes back). */
 export const OnboardingPatchSchema = z.strictObject({
-  dismissed: z.literal(true).optional(),
+  dismissed: z.boolean().optional(),
   completed: z.literal(true).optional(),
   /** #2287: the first open of the Welcome happened; a no-op for anyone but its user. */
   welcomeOpened: z.literal(true).optional(),
@@ -1577,6 +1610,30 @@ export const GetArtifactInputSchema = z.strictObject({
   path: z.string().optional(),
   includeContent: z.boolean().default(true),
   activity: z.string().max(PRESENCE_ACTIVITY_MAX).optional(),
+  // #3165: text view, search, and diff options for get_artifact.
+  view: z
+    .enum(["text"])
+    .optional()
+    .describe(
+      'Set to "text" to read an HTML page as plain text without CSS or markup.',
+    ),
+  find: z
+    .string()
+    .trim()
+    .min(1)
+    .max(500)
+    .optional()
+    .describe(
+      "Return only matching text blocks (case-insensitive) with context, capped at 4 KB.",
+    ),
+  sinceVersion: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "Return a unified text diff from this earlier version to the requested version, capped at 8 KB.",
+    ),
 });
 export type GetArtifactInput = z.infer<typeof GetArtifactInputSchema>;
 export type GetArtifactInputInput = z.input<typeof GetArtifactInputSchema>;
@@ -1721,6 +1778,7 @@ export const GetArtifactResultSchema = z.object({
   version: VersionInfoSchema,
   content: z.string().optional(),
   downloadUrl: z.string().optional(),
+  matches: z.number().int().min(0).optional(),
 });
 export type GetArtifactResult = z.infer<typeof GetArtifactResultSchema>;
 

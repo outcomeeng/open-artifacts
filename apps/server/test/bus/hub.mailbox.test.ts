@@ -12,7 +12,7 @@ import {
   MAILBOX_RETAIN_MS,
   type ServerFrame,
 } from "@oa/bus-protocol";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BusHub,
   CLOSED_AGENTS_PER_MACHINE,
@@ -21,13 +21,19 @@ import {
 import {
   type Daemon,
   daemon,
+  fence,
   hello,
   hubOf,
   machine,
   ns,
-  up,
+  up as plainUp,
   waitFor,
 } from "./helpers.js";
+import { eventually } from "./helpers.ts";
+
+/** #3143: only a name a person gave is a role, so these tests' sessions choose theirs. */
+const up = (...a: Parameters<typeof plainUp>): ReturnType<typeof plainUp> =>
+  ({ ...plainUp(...a), name_chosen: true }) as ClientFrame;
 
 const inHub = async <R>(fn: (i: BusHub, s: DurableObjectState) => R) =>
   runInDurableObject(await hubOf(), fn);
@@ -105,15 +111,13 @@ async function send(
 const close = async (d: Daemon, ref: string) => {
   d.send({ v: 1, id: id("c"), type: "sessions", open: [], closed: [ref] });
   // Closes are not acknowledged: wait until the hub has applied it.
-  for (let k = 0; k < 400; k++) {
+  await eventually(async () => {
     const r = await sqlOf<{ live: number }>(
       "select live from agents where native_ref = ? order by rowid desc limit 1",
       ref,
     );
-    if (r[0]?.live === 0) return;
-    await new Promise((res) => setTimeout(res, 5));
-  }
-  throw new Error("close never applied");
+    expect(r[0]?.live).toBe(0);
+  });
 };
 
 type Pair = { rcv: Daemon; snd: Daemon; n: string; name: string };
@@ -125,7 +129,9 @@ async function pair(t0: number): Promise<Pair & { ref: string }> {
   const rcv = await connect(rm.token);
   const snd = await connect(sm.token);
   const ref = uniq("r");
-  const name = await reg(rcv, ref, uniq("Rcv"), n);
+  const name = uniq("Rcv");
+  rcv.send(plainUp(id("u"), ref, name, n));
+  expect((await waitFor(rcv, "agent_ok")).bus_name).toBe(name);
   await reg(snd, "snd", uniq("Snd"), n);
   return { rcv, snd, n, name, ref };
 }
@@ -147,7 +153,7 @@ describe("lasting mailboxes (#1295 PR A)", () => {
     p.snd.close();
   });
 
-  it("2: another agent_ref proposing the reserved name takes it over, with the queued mail (#1742)", async () => {
+  it("2: another agent_ref proposing the reserved name gets a suffix and none of the queued mail (#3132, was #1742)", async () => {
     const t0 = base();
     const p = await pair(t0);
     await close(p.rcv, p.ref);
@@ -155,9 +161,9 @@ describe("lasting mailboxes (#1295 PR A)", () => {
     expect(r.state).toBe("pending");
     const om = await machine("Other");
     const o = await connect(om.token);
-    expect(await reg(o, uniq("other"), p.name, p.n)).toBe(p.name);
-    const d = await waitFor(o, "deliver");
-    expect(d.msg_id).toBe(r.msg_id);
+    expect(await reg(o, uniq("other"), p.name, p.n)).toBe(`${p.name}-2`);
+    await fence(o);
+    expect(o.raw.some((t) => t.includes('"deliver"'))).toBe(false);
     o.close();
     p.rcv.close();
     p.snd.close();
@@ -291,7 +297,7 @@ describe("lasting mailboxes (#1295 PR A)", () => {
     p.rcv.close();
     await p.rcv.closed;
     let disc: number | null = null;
-    for (let k = 0; k < 400 && disc === null; k++) {
+    await eventually(async () => {
       disc =
         (
           await sqlOf<{ t: number | null }>(
@@ -299,9 +305,8 @@ describe("lasting mailboxes (#1295 PR A)", () => {
             p.ref,
           )
         )[0]?.t ?? null;
-      if (disc === null) await new Promise((res) => setTimeout(res, 5));
-    }
-    expect(disc).toBe(t0);
+      expect(disc).toBe(t0);
+    });
     // Mail sent while the agent is still live (queued) an hour in.
     await setClock(t0 + HOUR);
     const r = await send(p.snd, "snd", p.name);
@@ -422,15 +427,16 @@ describe("lasting mailboxes (#1295 PR A)", () => {
     // The closes are not acknowledged (only the ups are): wait until the hub
     // has applied every one, or the last churn agent may still be open when
     // the inboxes are seeded and it, with no inbox, is evicted instead.
-    for (let k = 0; ; k++) {
-      const closed = await sqlOf<{ n: number }>(
-        "select count(*) as n from agents where machine_id = ? and live = 0",
-        machineId,
-      );
-      if ((closed[0]?.n ?? 0) >= CYCLES + 1) break;
-      if (k > 2000) throw new Error("the closes were never applied");
-      await new Promise((res) => setTimeout(res, 5));
-    }
+    await eventually(
+      async () => {
+        const closed = await sqlOf<{ n: number }>(
+          "select count(*) as n from agents where machine_id = ? and live = 0",
+          machineId,
+        );
+        expect(closed[0]?.n ?? 0).toBeGreaterThanOrEqual(CYCLES + 1);
+      },
+      { timeout: 20_000 },
+    );
     // Every closed agent now has an inbox. Seed ids are valid msg ids (an
     // agent id has the same shape), so a sender told about one decodes it.
     await inHub((_, st) => {
@@ -535,8 +541,10 @@ describe("lasting mailboxes (#1295 PR A)", () => {
     const l = await connect(lm.token);
     const LEADS = 7;
     const leads: string[] = [];
-    for (let k = 0; k < LEADS; k++)
-      leads.push(await reg(l, `lead${k}`, uniq("Lead"), n));
+    for (let k = 0; k < LEADS; k++) {
+      l.send(plainUp(id("u"), `lead${k}`, uniq("Lead"), n));
+      leads.push((await waitFor(l, "agent_ok")).bus_name);
+    }
     const live = await reg(r, "keeper", uniq("Keeper"), n);
     for (let k = 0; k < LEADS; k++) await close(l, `lead${k}`);
     const bystander = await reg(l, "bystander", uniq("By"), n);
@@ -565,7 +573,7 @@ describe("lasting mailboxes (#1295 PR A)", () => {
         v: 1,
         id: `oc${k}`,
         type: "sessions",
-        open: [],
+        open: ["keeper"],
         closed: [`shot_${k}`],
       });
     }
@@ -661,7 +669,7 @@ describe("lasting mailboxes (#1295 PR A)", () => {
     const e = await waitFor(p.rcv, "error");
     expect(e.id).toBe("fx");
     expect(e.code).toBe("not_found");
-    await new Promise((res) => setTimeout(res, 50));
+    await fence(p.rcv);
     expect(p.rcv.raw.some((t) => t.includes('"deliver"'))).toBe(false);
     p.rcv.close();
     p.snd.close();
@@ -681,14 +689,13 @@ describe("lasting mailboxes (#1295 PR A)", () => {
       expect(d.msg_id).toBe(r.msg_id);
       p.rcv.send({ v: 1, id: `ak${k}`, type: "ack", msg_id: r.msg_id });
     }
-    for (let k = 0; k < 400; k++) {
+    await eventually(async () => {
       const st = await sqlOf<{ n: number }>(
         `select count(*) as n from receipts where state = 'delivered' and id in (${ids.map(() => "?").join(",")})`,
         ...ids,
       );
-      if (st[0]?.n === N) break;
-      await new Promise((res) => setTimeout(res, 5));
-    }
+      expect(st[0]?.n).toBe(N);
+    });
     await close(p.rcv, p.ref);
     // The drain has not run: bodies are left past the inline batch.
     expect(

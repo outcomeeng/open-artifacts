@@ -2,23 +2,30 @@
 // reach other namespaces: its live holder sees and messages the agents there,
 // and they reply to it, only on sockets whose hello listed BUS_CAPS.reach.
 // Nothing else in the target namespace sees the holder, and reach is never
-// transitive. Rows are written through the hub's Worker-only putReach (as
+// transitive. #3132: a new session asking an away holder's name never takes its
+// mail or reach (it gets a suffix), so who sent the mail no longer matters. Rows are written through the hub's Worker-only putReach (as
 // hub.links.test.ts uses putLink); no frame writes one.
 import { BUS_CAPS, type ClientFrame, type ServerFrame } from "@oa/bus-protocol";
 import { BUS_REACH_MAX, BUS_REACH_PER_ROLE } from "@oa/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { OWNER_ORG_ID } from "../../src/bus/hub.js";
 import { addReach, reachNamespaces } from "../../src/bus/reach.js";
 import {
   type Daemon,
   daemon,
+  fence,
   hubOf,
   inOwnerHub,
   machine,
   ns,
-  up,
+  up as plainUp,
   waitFor,
 } from "./helpers.js";
+import { eventually } from "./helpers.ts";
+
+/** #3143: only a name a person gave is a role, so these tests' sessions choose theirs. */
+const up = (...a: Parameters<typeof plainUp>): ReturnType<typeof plainUp> =>
+  ({ ...plainUp(...a), name_chosen: true }) as ClientFrame;
 
 let seq = 0;
 const uniq = (t: string) => `${t}-${++seq}x${Date.now() % 1e8}`;
@@ -44,7 +51,7 @@ async function connect(caps: string[] | undefined): Promise<Daemon> {
 }
 
 async function agent(d: Daemon, ref: string, name: string, namespace: string) {
-  d.send(up(`u${++seq}`, ref, name, namespace));
+  d.send(plainUp(`u${++seq}`, ref, name, namespace));
   expect((await waitFor(d, "agent_ok")).bus_name).toBe(name);
 }
 
@@ -108,11 +115,8 @@ const shape = (r: Receipt) => {
 };
 const changed = (d: Daemon) =>
   d.raw.filter((t) => t.includes('"roster_changed"'));
-async function waitUntil(ok: () => boolean) {
-  for (let i = 0; i < 400 && !ok(); i++)
-    await new Promise((r) => setTimeout(r, 25));
-  expect(ok()).toBe(true);
-}
+const waitUntil = (ok: () => boolean) =>
+  eventually(() => expect(ok()).toBe(true), { interval: 20 });
 
 /**
  * X holds `holder` (role `lead`, reaching Y) and `peer`; Y holds `bob` and
@@ -391,6 +395,7 @@ describe("the reply path by every name", () => {
       v: 1,
       id: `r${++seq}`,
       type: "rename",
+      name_chosen: true,
       agent_ref: "h",
       proposed_name: fresh,
       name_kind: "chosen",
@@ -403,6 +408,7 @@ describe("the reply path by every name", () => {
       v: 1,
       id: `r${++seq}`,
       type: "rename",
+      name_chosen: true,
       agent_ref: "p",
       proposed_name: uniq("pr"),
       name_kind: "chosen",
@@ -424,12 +430,13 @@ describe("the reply path by every name", () => {
 
 async function waitUntilAway(w: { x: string; hn: string }) {
   const hub = await hubOf();
-  for (let i = 0; i < 200; i++) {
-    const open = (await hub.snapshot()).agents.some((a) => a.name === w.hn);
-    if (!open) return;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error("holder never went away");
+  await eventually(
+    async () =>
+      expect((await hub.snapshot()).agents.some((a) => a.name === w.hn)).toBe(
+        false,
+      ),
+    { interval: 20 },
+  );
 }
 
 async function renameTo(d: Daemon, ref: string, name: string) {
@@ -438,6 +445,7 @@ async function renameTo(d: Daemon, ref: string, name: string) {
     v: 1,
     id,
     type: "rename",
+    name_chosen: true,
     agent_ref: ref,
     proposed_name: name,
   } as ClientFrame);
@@ -473,20 +481,17 @@ async function expectBlocked(w: World, how: "up" | "rename") {
   const t = await takeName(w, how);
   expect(t.got).not.toBe(w.hn);
   expect(t.got.startsWith(w.hn)).toBe(true);
-  await new Promise((res) => setTimeout(res, 200));
+  await fence(t.d);
   expect(delivers(t.d)).toEqual([]);
   t.extra?.close();
 }
 
+/** #3132: a newcomer asking the away name gets a suffix and none of its mail, whoever sent it. */
 async function expectReclaimed(w: World, how: "up" | "rename") {
-  const t = await takeName(w, how);
-  expect(t.got).toBe(w.hn);
-  await waitFor(t.d, "deliver");
-  t.extra?.close();
-  return t;
+  await expectBlocked(w, how);
 }
 
-describe("name reclaim never hands cross-namespace mail to a newcomer (#1742, #1346)", () => {
+describe("a new session asking an away name never gets its mail or reach (#1742, #1346, #3132)", () => {
   for (const how of ["up", "rename"] as const) {
     it(`${how}: pending mail from another namespace blocks the takeover`, async () => {
       const w = await world();
@@ -542,18 +547,18 @@ describe("name reclaim never hands cross-namespace mail to a newcomer (#1742, #1
     w.close();
   });
 
-  it("a granted role with no cross-namespace mail is reclaimed from, and the newcomer gets no reach", async () => {
+  it("a granted role with no cross-namespace mail: the newcomer still gets a suffix and no reach", async () => {
     const w = await world();
     await holderAway(w);
     const dn = await connect(REACH);
     dn.send(up(`u${++seq}`, "newcomer", w.hn, w.x));
-    expect((await waitFor(dn, "agent_ok")).bus_name).toBe(w.hn);
+    expect((await waitFor(dn, "agent_ok")).bus_name).toBe(`${w.hn}-2`);
     expect(names(await list(dn, "newcomer"))).not.toContain(w.bn);
     dn.close();
     w.close();
   });
 
-  it("same-namespace mail does not block, by agent_up or rename", async () => {
+  it("same-namespace mail: the newcomer gets a suffix and none of it, by agent_up or rename", async () => {
     for (const how of ["up", "rename"] as const) {
       const w = await world();
       const dq = await connect(REACH);
@@ -567,7 +572,7 @@ describe("name reclaim never hands cross-namespace mail to a newcomer (#1742, #1
   });
 
   for (const how of ["up", "rename"] as const) {
-    it(`${how}: mail from a linked namespace does not block`, async () => {
+    it(`${how}: mail from a linked namespace: the newcomer gets a suffix and none of it`, async () => {
       const w = await world();
       const hub = await hubOf();
       for (const g of await hub.listReach()) await hub.deleteReach(g.id);
@@ -581,7 +586,7 @@ describe("name reclaim never hands cross-namespace mail to a newcomer (#1742, #1
       w.close();
     });
 
-    it(`${how}: mail from a global sender does not block`, async () => {
+    it(`${how}: mail from a global sender: the newcomer gets a suffix and none of it`, async () => {
       const w = await world();
       const hub = await hubOf();
       for (const g of await hub.listReach()) await hub.deleteReach(g.id);
@@ -593,13 +598,15 @@ describe("name reclaim never hands cross-namespace mail to a newcomer (#1742, #1
       expect(r.state).toBe("pending");
       await expectReclaimed(w, how);
       dg.send({ v: 1, id: `d${++seq}`, type: "agent_down", agent_ref: "g" });
-      for (let i = 0; i < 200; i++) {
-        const open = (await hub.snapshot()).agents.some((a) =>
-          a.name.startsWith("glob"),
-        );
-        if (!open) break;
-        await new Promise((res) => setTimeout(res, 25));
-      }
+      await eventually(
+        async () =>
+          expect(
+            (await hub.snapshot()).agents.some((a) =>
+              a.name.startsWith("glob"),
+            ),
+          ).toBe(false),
+        { interval: 20 },
+      );
       dg.close();
       w.close();
     });

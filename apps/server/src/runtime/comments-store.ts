@@ -192,6 +192,7 @@ export type StoredComment = {
   asked?: StoredTarget[];
   /** #2770: the people this comment @mentions, by user id (comment_targets kind "person"). */
   people?: string[];
+  personLabels?: Record<string, string>;
   /** #2035: the participant agents a person's reply also told (comment_targets kind "reply"). */
   notified?: StoredTarget[];
   /** #2577: agents of other people this comment's delivery is held for (comment_targets kind "held"): `held` until their person allows it, `releasing` between the allow and the notice. */
@@ -222,6 +223,7 @@ export type NewExtras = {
   asked?: StoredAgent[];
   /** #2770: people @mentioned, by user id; already checked to be able to read the artifact. */
   people?: string[];
+  personLabels?: Record<string, string>;
   /** A reply addressed to the ask's author (#1614): stored as a mention of its agents, under its own kind so the notice can be bounded. */
   asker?: StoredAgent[];
   /** #2577: held for the agent's person; the words stay, undelivered, and agents of that person read a placeholder. `way`: mention | reply | ask | page. */
@@ -242,6 +244,8 @@ export type StoredParticipant = StoredAgent & {
   readd?: true;
   /** #1968: joined only because it published the page a page-wide thread is on; any other reason clears it. */
   page?: true;
+  /** #3132: when it joined the thread (ISO), as a reply's notice reads it; never stored from here. */
+  joinedAt?: string;
 };
 
 export type StoredThread = {
@@ -259,6 +263,8 @@ export type StoredList = {
   threads: StoredThread[];
   open: number;
   truncated: boolean;
+  /** #3168: the newest change instant and its count, for the list_comments cursor. */
+  latest: LatestActivity;
 };
 
 type ThreadRow = {
@@ -309,6 +315,37 @@ export const openCount = (sql: SqlStorage): number =>
     .one().n;
 
 /**
+ * #3168: the newest change instant on this artifact (thread activity: a new
+ * comment, an answer, a withdraw, a resolve; or a comment edit) and how many
+ * changes carry exactly that instant. The count lets a cursor tell a later
+ * change in the same millisecond from the ones it already saw.
+ */
+export type LatestActivity = { at: string | null; n: number };
+
+/** #3168: how many thread activities and comment edits carry exactly `at`. */
+const changesAt = (sql: SqlStorage, at: string): number =>
+  sql
+    .exec<{ n: number }>(
+      `select (select count(*) from comment_threads where activity_at = ?1)
+            + (select count(*) from comments where edited_at = ?1) as n`,
+      at,
+    )
+    .one().n;
+
+export function latestActivity(sql: SqlStorage): LatestActivity {
+  const at = sql
+    .exec<{ latest: string | null }>(
+      `select max(t) as latest from (
+         select max(activity_at) as t from comment_threads
+         union all
+         select max(edited_at) as t from comments where edited_at is not null
+       )`,
+    )
+    .one().latest;
+  return { at, n: at === null ? 0 : changesAt(sql, at) };
+}
+
+/**
  * Threads by newest activity, at most COMMENTS_MAX_THREADS and at most
  * COMMENTS_MAX_TOTAL comments and COMMENTS_MAX_BYTES of bodies across them (the list stops at the first thread
  * that would pass it, truncated), each with its root and at most
@@ -320,9 +357,26 @@ export function listThreads(
   status: CommentStatus | "all",
   /** Bounds the answer by body bytes; injectable for tests. */
   maxBytes: number = COMMENTS_MAX_BYTES,
+  /** #3168: when set, only threads with a change after this cursor point. */
+  since?: LatestActivity,
 ): StoredList {
-  const where = status === "all" ? "" : "where status = ?";
-  const args = status === "all" ? [] : [status];
+  const conds: string[] = [];
+  const args: unknown[] = [];
+  if (status !== "all") {
+    conds.push("status = ?");
+    args.push(status);
+  }
+  if (since?.at) {
+    // Strictly after the cursor's instant, unless a change has landed at that
+    // very instant since the cursor was made (its count grew): then that
+    // instant is included, so a same-millisecond write is never missed.
+    const op = changesAt(sql, since.at) > since.n ? ">=" : ">";
+    conds.push(
+      `(activity_at ${op} ? or exists (select 1 from comments c where c.thread_id = comment_threads.id and c.edited_at ${op} ?))`,
+    );
+    args.push(since.at, since.at);
+  }
+  const where = conds.length > 0 ? `where ${conds.join(" and ")}` : "";
   const rows = sql
     .exec<ThreadRow>(
       `select ${THREAD_COLS} from comment_threads ${where}
@@ -397,6 +451,7 @@ export function listThreads(
     threads: kept.map((r) => toThread(r, byThread.get(r.id) ?? [])),
     open: openCount(sql),
     truncated,
+    latest: latestActivity(sql),
   };
 }
 
@@ -539,6 +594,10 @@ function attachExtras(
     const c = byId.get(r.comment_id);
     if (!c) continue;
     if (r.kind === "person") {
+      if (r.name) {
+        c.personLabels ??= {};
+        c.personLabels[r.key] = r.name;
+      }
       c.people = [...(c.people ?? []), r.key];
       continue;
     }
@@ -759,10 +818,11 @@ export function insertExtras(
   for (const id of x.people ?? [])
     sql.exec(
       `insert or ignore into comment_targets (comment_id, thread_id, kind, key, name, state, owner, identity)
-       values (?, ?, 'person', ?, '', 'noted', null, null)`,
+       values (?, ?, 'person', ?, ?, 'noted', null, null)`,
       commentId,
       threadId,
       id,
+      x.personLabels?.[id] ?? "",
     );
   for (const h of x.held ?? [])
     addHeld(sql, threadId, commentId, h.agent, h.way);
@@ -1157,8 +1217,8 @@ export function addParticipants(
 ): void {
   for (const p of ps) {
     sql.exec(
-      `insert into comment_participants (thread_id, key, name, owner, namespace, page, identity)
-       values (?, ?, ?, ?, ?, ?, ?)
+      `insert into comment_participants (thread_id, key, name, owner, namespace, page, identity, joined_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?)
        on conflict (thread_id, key) do update set page = 0 where excluded.page = 0`,
       threadId,
       p.key,
@@ -1167,6 +1227,7 @@ export function addParticipants(
       p.namespace,
       p.page ? 1 : 0,
       p.identity ? JSON.stringify(p.identity) : null,
+      new Date().toISOString(),
     );
     // A later comment may know the identity an earlier one did not.
     if (p.identity)
@@ -1196,6 +1257,7 @@ type ParticipantSql = {
   page: number;
   removed: number;
   identity: string | null;
+  joinedAt?: string | null;
 };
 
 const participantOfRow = (r: ParticipantSql): ParticipantRow => ({
@@ -1309,7 +1371,9 @@ export function takeThreadReply(
   const out: StoredParticipant[] = [];
   const rows = sql
     .exec<ParticipantSql>(
-      `select key, name, owner, namespace, page, removed, identity from comment_participants
+      `select key, name, owner, namespace, page, removed, identity,
+         coalesce(joined_at, (select min(c.created_at) from comments c where c.thread_id = p.thread_id)) as joinedAt
+       from comment_participants p
        where thread_id = ? and removed = 0 order by key`,
       threadId,
     )
@@ -1349,6 +1413,7 @@ export function takeThreadReply(
       owner: r.owner,
       namespace: r.namespace,
       ...(identity ? { identity } : {}),
+      ...(r.joinedAt ? { joinedAt: r.joinedAt } : {}),
     });
   }
   return out;

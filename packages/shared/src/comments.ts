@@ -23,16 +23,40 @@ export const CommentAuthorSchema = z.object({
   id: z.string().optional(),
   /** An agent's own name (never the person's), a guest's name, or a user's name. */
   name: z.string(),
+  handle: z.string().optional(),
+  mentionedAs: z.string().optional(),
   /** An agent only: the person it acts for, by public name (never an email). */
   for: z.string().optional(),
   /** An agent only: a bus-linked agent (#1822). False for a connection the server cannot tell apart. */
   linked: z.boolean().optional(),
   /** A linked agent only: its product (for example "Claude Code"), from the bus, never client input. */
   product: z.string().optional(),
+  /** A linked agent of a kind the server has no product for: the hub kind token, at most 32 characters (agy S6), for a letter tile. */
+  appKind: z.string().optional(),
   /** A linked agent only: its face, from its identity. `color` is a presence palette index. */
   animal: z
     .object({ id: z.string(), color: z.number().int().min(0) })
     .optional(),
+  /**
+   * A linked agent only (#3132): the role its session holds, or held before
+   * the role moved on. The role is the address to @-mention; `holder` is the
+   * session that holds it now, when that is another one ("now <holder>").
+   * Never shown to a guest or an outsider.
+   */
+  role: z
+    .object({
+      name: z.string(),
+      holder: z.string().optional(),
+      machine: z.string().optional(),
+      holderMachine: z.string().optional(),
+      holderProduct: z.string().optional(),
+    })
+    .optional(),
+  /**
+   * With `role` (#3132): `name` is the role, and this is the session's own
+   * bus name, for the small print.
+   */
+  session: z.string().optional(),
   /** @deprecated Old "via <label>"; the server no longer sets it (`kind: "agent"` carries the name). */
   agent: z.string().optional(),
   me: z.boolean(),
@@ -219,6 +243,7 @@ export type MentionDelivery = z.infer<typeof MentionDeliverySchema>;
 const partyFace = {
   linked: z.boolean().optional(),
   product: z.string().optional(),
+  appKind: z.string().optional(),
   animal: z
     .object({ id: z.string(), color: z.number().int().min(0) })
     .optional(),
@@ -389,6 +414,8 @@ export const CommentListSchema = z.object({
   threads: z.array(CommentThreadSchema),
   open: z.number().int().min(0),
   truncated: z.boolean(),
+  /** #3168: opaque cursor for the next list_comments `since` read. */
+  cursor: z.string().optional(),
 });
 export type CommentList = z.infer<typeof CommentListSchema>;
 
@@ -422,6 +449,8 @@ export const CompactCommentListSchema = z.object({
   answers: z.array(CompactAnswerSchema).optional(),
   mentions: z.array(CompactMentionSchema).optional(),
   truncated: z.boolean(),
+  /** #3168: opaque cursor for the next list_comments `since` read. */
+  cursor: z.string().optional(),
 });
 export type CompactCommentList = z.infer<typeof CompactCommentListSchema>;
 
@@ -548,7 +577,10 @@ export type AnswerChallenge = z.infer<typeof AnswerChallengeSchema>;
 /** GET R.artifactAgents: the agents that follow or publish to the artifact. */
 export const ArtifactAgentSchema = z.object({
   key,
+  /** #3132: the role it holds, when it holds one (then `session` is its own name). */
   name: z.string(),
+  /** #3132: with a role as `name`, the session's own bus name, for the small print. */
+  session: z.string().optional(),
   /** `state === "online"`; kept for readers that predate `state`. */
   online: z.boolean(),
   /** The session itself: online (live now) or away (listed on the bus, not live). Ended sessions are not listed. */
@@ -592,6 +624,12 @@ export const ListCommentsInputSchema = z.strictObject({
   mentionedSince: SinceIso.optional(),
   /** With answeredSince or mentionedSince: a small list instead of full threads. */
   compact: z.boolean().optional(),
+  /** #3139: only this thread (the id a comment notice names). */
+  threadId: z.string().min(1).max(128).optional(),
+  /** #3139: with threadId, only this comment, the comment before it and the thread's first comment. */
+  commentId: z.string().min(1).max(128).optional(),
+  /** #3168: opaque cursor from an earlier list_comments; only threads changed after it. */
+  since: z.string().optional(),
 });
 export type ListCommentsInput = z.infer<typeof ListCommentsInputSchema>;
 
@@ -618,6 +656,11 @@ export const AddCommentInputSchema = z.strictObject({
    * to you in this thread. Otherwise it is ignored; nothing is refused.
    */
   requestCommentId: key.optional(),
+  /** #3163: true returns the full comment or thread, as before. */
+  verbose: z
+    .boolean()
+    .optional()
+    .describe("true returns the full comment or thread, as before"),
 });
 export type AddCommentInput = z.infer<typeof AddCommentInputSchema>;
 
@@ -627,6 +670,11 @@ export const WithdrawAskInputSchema = z.strictObject({
   threadId: IdSchema,
   commentId: key,
   replacedBy: ReplacesRefSchema.optional(),
+  /** #3163: true returns the full comment or thread, as before. */
+  verbose: z
+    .boolean()
+    .optional()
+    .describe("true returns the full comment or thread, as before"),
 });
 export type WithdrawAskInput = z.infer<typeof WithdrawAskInputSchema>;
 
@@ -650,5 +698,10 @@ export const ResolveCommentInputSchema = z.strictObject({
   id: IdSchema,
   threadId: IdSchema,
   resolved: z.boolean().optional(),
+  /** #3163: true returns the full comment or thread, as before. */
+  verbose: z
+    .boolean()
+    .optional()
+    .describe("true returns the full comment or thread, as before"),
 });
 export type ResolveCommentInput = z.infer<typeof ResolveCommentInputSchema>;

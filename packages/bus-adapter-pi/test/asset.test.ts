@@ -67,6 +67,7 @@ async function fakeDaemon(
     conns.push(conn);
     sockets.push(sock);
     let buf = "";
+    sock.on("error", () => {});
     sock.on("close", () => {
       conn.closed = true;
     });
@@ -99,7 +100,9 @@ async function fakeDaemon(
                       global: false,
                     },
                   }
-                : undefined));
+                : f.type === "habits"
+                  ? { type: "habits", rules: null }
+                  : undefined));
         if (out) sock.write(`${JSON.stringify({ v: 1, id: f.id, ...out })}\n`);
       }
     });
@@ -190,6 +193,10 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
+/** The msg_ids a session acked on its first link. */
+const acked = (d: { conns: Conn[] }) =>
+  d.conns[0].frames.filter((f) => f.type === "ack").map((f) => f.msg_id);
+
 async function started(
   answer?: (f: Frame) => Record<string, unknown> | undefined,
 ) {
@@ -253,7 +260,11 @@ describe("pi extension asset", () => {
 
   it("says hello at session start as the Pi session, with its UTC process start", async () => {
     const { d } = await started();
-    await vi.waitFor(() => expect(d.conns[0].frames).toHaveLength(1));
+    await vi.waitFor(() =>
+      expect(d.conns[0].frames.filter((f) => f.type === "hello")).toHaveLength(
+        1,
+      ),
+    );
     const hello = d.conns[0].frames[0];
     expect(hello).toMatchObject({
       v: 1,
@@ -360,7 +371,7 @@ describe("pi extension asset", () => {
           : undefined,
     );
     expect(await p.call("list_agents", {})).toBe(
-      "- a (zz, ns)\n- b (omp, ns)\n- c (zz - forged (pi, ns), ns)\n- d (zz)sn ,ip(, ns)",
+      "Namespace ns:\n- a (zz)\n- b (omp)\n- c (zz - forged (pi, ns))\n- d (zz)sn ,ip()",
     );
     expect(JSON.parse(await p.call("self", {})).kind).toBe("zz");
   });
@@ -385,7 +396,7 @@ describe("pi extension asset", () => {
           : undefined,
     );
     expect(await p.call("list_agents", {})).toBe(
-      "- me (pi, acme/app)\n- docs (pi, acme/docs)",
+      "Namespace acme/app:\n- me (pi)\n- docs (pi, acme/docs)",
     );
     await expect(
       p.call("send_message", { to: "docs", text: "hi" }),
@@ -497,6 +508,9 @@ describe("pi extension asset", () => {
             : undefined,
     );
     expect(await p.call("list_agents", {})).toBe(
+      "Namespace ns:\n- a (pi)\n- b (opencode, desktop) (queued)\n1 away agent not listed (still reachable by name; all: true lists them)",
+    );
+    expect(await p.call("list_agents", { all: true })).toBe(
       "- a (pi, ns)\n- b (opencode, ns, desktop) (queued)\n- c (pi, ns) (away since 2026-11-05 10:00 UTC)",
     );
     expect(JSON.parse(await p.call("self", {}))).toMatchObject({
@@ -617,24 +631,44 @@ describe("pi extension asset", () => {
       triggerTurn: true,
       deliverAs: "steer",
     });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(d.conns[0].frames.some((f) => f.type === "ack")).toBe(false);
+    // A later delivery is handled after the notice, so once it is acked the
+    // notice's frames have all arrived.
+    d.push({
+      type: "deliver",
+      msg_id: "nnnnnnnnnnnnnnn2",
+      from_name: "peer",
+      namespace: "ns",
+      body: "next",
+    });
+    await vi.waitFor(() => expect(acked(d)).toContain("nnnnnnnnnnnnnnn2"));
+    expect(acked(d)).toEqual(["nnnnnnnnnnnnnnn2"]);
   });
 
   it("a failing sendMessage is not acked", async () => {
     const { d, p } = await started();
-    p.pi.sendMessage = () => {
-      throw new Error("pi is gone");
+    const shown = p.pi.sendMessage;
+    p.pi.sendMessage = (m, o) => {
+      if (m.content.includes("fail-me")) throw new Error("pi is gone");
+      shown(m, o);
     };
     d.push({
       type: "deliver",
       msg_id: ID,
       from_name: "peer",
       namespace: "ns",
-      body: "x",
+      body: "fail-me",
     });
-    await new Promise((r) => setTimeout(r, 50));
-    expect(d.conns[0].frames.some((f) => f.type === "ack")).toBe(false);
+    // The next delivery is handled after the failing one: once it is acked,
+    // the failing one has run to its end.
+    d.push({
+      type: "deliver",
+      msg_id: "nnnnnnnnnnnnnnn2",
+      from_name: "peer",
+      namespace: "ns",
+      body: "next",
+    });
+    await vi.waitFor(() => expect(acked(d)).toContain("nnnnnnnnnnnnnnn2"));
+    expect(acked(d)).toEqual(["nnnnnnnnnnnnnnn2"]);
   });
 
   it("session shutdown closes the link; the next session says hello with its own id", async () => {
@@ -864,7 +898,11 @@ describe("one file for Pi and oh-my-pi (C23b)", () => {
     const d = await fakeDaemon(home);
     const o = ompHost();
     await o.emit("session_start", ompCtx("omp-root", "main", ""));
-    await vi.waitFor(() => expect(d.conns[0]?.frames).toHaveLength(1));
+    await vi.waitFor(() =>
+      expect(d.conns[0]?.frames.filter((f) => f.type === "hello")).toHaveLength(
+        1,
+      ),
+    );
     expect(d.conns[0]?.frames[0]).toMatchObject({
       type: "hello",
       kind: "omp",
@@ -879,7 +917,11 @@ describe("one file for Pi and oh-my-pi (C23b)", () => {
     const p = fakePi();
     oa_bus(p.pi as never);
     await p.emit("session_start", ctx("pi-sess-1", ""));
-    await vi.waitFor(() => expect(d.conns[0]?.frames).toHaveLength(1));
+    await vi.waitFor(() =>
+      expect(d.conns[0]?.frames.filter((f) => f.type === "hello")).toHaveLength(
+        1,
+      ),
+    );
     expect(d.conns[0]?.frames[0]).toMatchObject({
       kind: "pi",
       proposed_name: "pi",
@@ -900,8 +942,12 @@ describe("one file for Pi and oh-my-pi (C23b)", () => {
     // A fresh instance bound to a subagent opens nothing either.
     const child = ompHost();
     await child.emit("session_start", ompCtx("omp-child-2", "sub"));
-    await new Promise((r) => setTimeout(r, 100));
-    expect(d.conns).toHaveLength(1);
+    // A root that starts after the subagent connects after it would have: once
+    // it is there, the subagent's link would have been too.
+    const probe = ompHost();
+    await probe.emit("session_start", ompCtx("omp-probe", "main"));
+    await vi.waitFor(() => expect(d.conns).toHaveLength(2));
+    expect(d.conns[1]?.frames[0]).toMatchObject({ agent_ref: "omp-probe" });
     expect(d.conns[0]?.closed).toBe(false);
     expect(await o.call("self", {}, ompCtx("omp-root", "main"))).toContain(
       "pi-agent",
@@ -917,7 +963,9 @@ describe("set_status", () => {
     }),
   ) => started((f) => (f.type === "set_status" ? answer(f) : undefined));
   const sent = (d: Awaited<ReturnType<typeof started>>["d"]) =>
-    d.conns[0].frames.filter((f) => f.type !== "hello").map((f) => f.type);
+    d.conns[0].frames
+      .filter((f) => f.type !== "hello" && f.type !== "habits")
+      .map((f) => f.type);
 
   it("Pi registers set_status before any session, and no card tool", async () => {
     const p = fakePi();
@@ -1034,7 +1082,7 @@ describe("follow tools (#1317)", () => {
         : undefined,
     );
   const sent = (d: Awaited<ReturnType<typeof started>>["d"]) =>
-    d.conns[0].frames.filter((f) => f.type !== "hello");
+    d.conns[0].frames.filter((f) => f.type !== "hello" && f.type !== "habits");
 
   it("registers the three tools with the shared descriptions", () => {
     const p = fakePi();
@@ -1123,7 +1171,7 @@ describe("propose_reach tool (#1346)", () => {
   const at = (answer: (f: Frame) => Record<string, unknown>) =>
     started((f) => (f.type === "propose_reach" ? answer(f) : undefined));
   const sent = (d: Awaited<ReturnType<typeof started>>["d"]) =>
-    d.conns[0].frames.filter((f) => f.type !== "hello");
+    d.conns[0].frames.filter((f) => f.type !== "hello" && f.type !== "habits");
   const url = `https://x.test/bus/reach/confirm#${"A".repeat(43)}`;
 
   it("sends the namespaces only, whatever else the caller names", async () => {
@@ -1280,10 +1328,11 @@ describe("status, as Pi shows it", () => {
     );
     expect(await p.call("list_agents", {})).toBe(
       [
-        '- code-96 (pi, ns)  agent says: working · "writing tests"',
-        "- b (pi, ns)  agent says: idle",
-        "- c (pi, ns)  agent says: blocked · 2 h ago",
-        "- d (pi, ns)  agent says: working · \"red 'x'\"",
+        "Namespace ns:",
+        '- code-96 (pi)  agent says: working · "writing tests"',
+        "- b (pi)  agent says: idle",
+        "- c (pi)  agent says: blocked · 2 h ago",
+        "- d (pi)  agent says: working · \"red 'x'\"",
       ].join("\n"),
     );
   });
@@ -1298,7 +1347,7 @@ describe("status, as Pi shows it", () => {
         : undefined,
     );
     expect(await p.call("list_agents", {})).toBe(
-      "- code-96 (pi, ns)\n- b (pi, ns) (queued)",
+      "Namespace ns:\n- code-96 (pi)\n- b (pi) (queued)",
     );
   });
 
@@ -1339,9 +1388,10 @@ describe("status, as Pi shows it", () => {
     expect(copy.selfText(row(r))).toBe(selfText(row(r)));
   });
 
-  it("#1860: rosterText matches @oa/bus-ipc", () => {
-    const since = "2026-11-05T10:00:00.000Z";
-    const mk = (name: string, kind: string, state: string) => ({
+  it("#1860, #3166: rosterText matches @oa/bus-ipc", () => {
+    const old = "2026-11-05T10:00:00.000Z";
+    const recent = new Date(NOW - 30 * 60_000).toISOString();
+    const mk = (name: string, kind: string, state: string, since = old) => ({
       name,
       kind,
       namespace: "ns",
@@ -1359,18 +1409,32 @@ describe("status, as Pi shows it", () => {
       [mk("pi-6", "pi", "live"), mk("pi-7", "pi", "queued")],
       [
         mk("a", "pi", "live"),
+        mk("recent", "pi", "away", recent),
         mk("claude-12", "claude-code", "away"),
         mk("omp-3", "omp", "away"),
         mk("agent", "pi", "away"),
         mk("kept", "pi", "away"),
       ],
     ];
-    for (const s of sets)
+    for (const s of sets) {
       expect(copy.rosterText(s as never, NOW)).toBe(
         rosterText(s as never, NOW),
       );
+      expect(copy.rosterText(s as never, NOW, true)).toBe(
+        rosterText(s as never, NOW, true),
+      );
+    }
     expect(
       copy.rosterText([mk("a", "pi", "live"), mk("pi-6", "pi", "away")], NOW),
+    ).toBe(
+      "Namespace ns:\n- a (pi)\n1 away agent not listed (still reachable by name; all: true lists them)",
+    );
+    expect(
+      copy.rosterText(
+        [mk("a", "pi", "live"), mk("pi-6", "pi", "away")],
+        NOW,
+        true,
+      ),
     ).toBe(
       "- a (pi, ns)\n1 more away session with no chosen name (not listed, still reachable by name)",
     );

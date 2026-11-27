@@ -14,6 +14,7 @@
 import {
   BUS_REACH_PER_ROLE,
   BUS_ROLE_MAX,
+  BUS_ROLE_PROPOSAL_CARD_TTL_MS,
   BUS_ROLE_PROPOSAL_TTL_MS,
   BUS_ROLE_PROPOSALS_LISTED,
   BUS_ROLE_PROPOSALS_PENDING_MAX,
@@ -23,7 +24,13 @@ import {
 } from "@oa/shared";
 import { iso } from "./dto.js";
 import { reachOfRole } from "./reach.js";
-import { checkRole, deleteRole, putRole, type RoleRefusal } from "./roles.js";
+import {
+  checkRole,
+  deleteRole,
+  putRole,
+  type RoleMove,
+  type RoleRefusal,
+} from "./roles.js";
 
 /** Decided proposals kept for the dashboard: at most this many, and none older than RETAIN_MS. */
 const RETAIN_MAX = 100;
@@ -110,6 +117,8 @@ export type DecideResult =
       proposal: BusRoleProposal;
       /** The role as set (set, repoint); null after a clear. */
       role: BusRole | null;
+      /** #3132: set when the confirm moved the role between sessions. */
+      moved: RoleMove | null;
       audit: ProposalAudit;
       expired: ProposalAudit[];
     }
@@ -193,6 +202,22 @@ const auditOf = (p: {
   priorAgentId: p.priorAgentId,
 });
 
+const byId = (sql: SqlStorage, orgId: string, id: string) =>
+  one<StoredProposal>(
+    sql,
+    `${PROPOSAL_SELECT} where p.org_id = ? and p.id = ?`,
+    orgId,
+    id,
+  );
+
+/**
+ * #3132: the one-time link of a proposal works only BUS_ROLE_PROPOSAL_TTL_MS
+ * after it was made; the card in the dashboard (decideProposalById) stays
+ * open until expires_at, a day on.
+ */
+const linkLapsed = (p: StoredProposal, now: number) =>
+  now >= p.createdAt + BUS_ROLE_PROPOSAL_TTL_MS;
+
 const byHash = (sql: SqlStorage, orgId: string, hash: string) =>
   one<StoredProposal>(
     sql,
@@ -235,6 +260,21 @@ export function expireProposals(
     RETAIN_MAX,
   );
   return gone;
+}
+
+/** Freeing a name settles every pending proposal for its deleted role ID. */
+export function refuseFreedRoleProposals(
+  sql: SqlStorage,
+  orgId: string,
+  roleId: string,
+  now: number,
+): void {
+  sql.exec(
+    "update role_proposals set status = 'refused', reason = 'no_role', decided_at = ? where org_id = ? and role_id = ? and status = 'pending'",
+    now,
+    orgId,
+    roleId,
+  );
 }
 
 /**
@@ -371,7 +411,7 @@ export function propose(
     priorAgentId,
     nameOf(sql, orgId, priorAgentId),
     now,
-    now + BUS_ROLE_PROPOSAL_TTL_MS,
+    now + BUS_ROLE_PROPOSAL_CARD_TTL_MS,
     input.credential ?? null,
   );
   const row = byHash(sql, orgId, tokenHash);
@@ -449,6 +489,8 @@ export function viewProposal(
       proposal: dto,
       expired,
     };
+  if (linkLapsed(p, now))
+    return { ok: false, reason: "expired", proposal: dto, expired };
   const why = blocker(sql, orgId, p, now, maxRoles);
   return why === null
     ? {
@@ -482,7 +524,80 @@ export function decideProposal(
   maxRoles: number = BUS_ROLE_MAX,
 ): DecideResult {
   const expired = expireProposals(sql, orgId, now);
-  const p = byHash(sql, orgId, tokenHash);
+  return decideStored(
+    sql,
+    orgId,
+    byHash(sql, orgId, tokenHash),
+    true,
+    decision,
+    now,
+    newId,
+    maxRoles,
+    expired,
+  );
+}
+
+/**
+ * #3132: decides the proposal `id`, for the dashboard card (a member's
+ * browser session; services/bus.ts). Same rules as decideProposal, but the
+ * card lives until the proposal's own expiry, not the link's.
+ */
+export function decideProposalById(
+  sql: SqlStorage,
+  orgId: string,
+  id: string,
+  decision: "confirm" | "reject",
+  now: number,
+  newId: () => string,
+  maxRoles: number = BUS_ROLE_MAX,
+): DecideResult {
+  const expired = expireProposals(sql, orgId, now);
+  const p = byId(sql, orgId, id);
+  // A card already open in a browser can outlive an away interval.
+  if (
+    p?.status === "pending" &&
+    p.action === "repoint" &&
+    one(
+      sql,
+      "select 1 from roles r join agents a on a.id = r.agent_id and a.org_id = r.org_id where r.org_id = ? and r.id = ? and a.id = ? and a.live = 1",
+      orgId,
+      p.roleId,
+      p.priorAgentId,
+    )
+  ) {
+    return {
+      ok: false,
+      reason: "unknown",
+      proposal: null,
+      audit: null,
+      expired,
+    };
+  }
+  return decideStored(
+    sql,
+    orgId,
+    p,
+    false,
+    decision,
+    now,
+    newId,
+    maxRoles,
+    expired,
+  );
+}
+
+function decideStored(
+  sql: SqlStorage,
+  orgId: string,
+  p: StoredProposal | null,
+  /** The one-time link's rules: it lapses sooner than the card. */
+  byLink: boolean,
+  decision: "confirm" | "reject",
+  now: number,
+  newId: () => string,
+  maxRoles: number,
+  expired: ProposalAudit[],
+): DecideResult {
   if (p === null)
     return {
       ok: false,
@@ -499,6 +614,14 @@ export function decideProposal(
       audit: null,
       expired,
     };
+  if (byLink && linkLapsed(p, now))
+    return {
+      ok: false,
+      reason: "expired",
+      proposal: proposalDto(p),
+      audit: null,
+      expired,
+    };
   const settle = (status: "applied" | "refused", reason: string | null) => {
     sql.exec(
       "update role_proposals set status = ?, reason = ?, decided_at = ? where id = ? and status = 'pending'",
@@ -507,7 +630,7 @@ export function decideProposal(
       now,
       p.id,
     );
-    const row = byHash(sql, orgId, tokenHash);
+    const row = byId(sql, orgId, p.id);
     if (row === null) throw new Error("proposal row missing after write");
     return proposalDto(row);
   };
@@ -524,6 +647,7 @@ export function decideProposal(
   const why = blocker(sql, orgId, p, now, maxRoles);
   if (why !== null) return refuse(why);
   let role: BusRole | null = null;
+  let moved: RoleMove | null = null;
   if (p.action === "clear") {
     if (p.roleId === null) throw new Error("clear proposal without a role id");
     deleteRole(sql, orgId, p.roleId);
@@ -540,11 +664,13 @@ export function decideProposal(
     );
     if (!r.ok) return refuse(r.reason);
     role = r.role;
+    moved = r.moved;
   }
   return {
     ok: true,
     proposal: settle("applied", null),
     role,
+    moved,
     audit: auditOf(p),
     expired,
   };

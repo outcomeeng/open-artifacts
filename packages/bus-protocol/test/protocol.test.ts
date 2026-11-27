@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { AGENT_KINDS, KindTokenSchema } from "../src/kinds.ts";
 import { LIMITS } from "../src/limits.ts";
 import {
   NamespaceSchema,
@@ -172,6 +174,7 @@ describe("frames", () => {
       "update_report",
       "guest_up",
       "guest_down",
+      "codex_call_checked",
     ]);
     expect(SERVER_FRAMES).toEqual([
       "hello_ok",
@@ -195,6 +198,8 @@ describe("frames", () => {
       "update_ack",
       "owner_away",
       "proof_seen",
+      "codex_call_check",
+      "codex_call_verdict",
     ]);
   });
   it("formats a rejection with the frame id when there is one", () => {
@@ -624,12 +629,27 @@ describe("frames", () => {
         }),
       ),
     ).not.toBeNull();
-    const s = (open: string[], closed: string[]) =>
-      okc(JSON.stringify({ ...base, type: "sessions", open, closed }));
+    const s = (open: string[], closed: string[], gone?: string[]) =>
+      okc(
+        JSON.stringify({
+          ...base,
+          type: "sessions",
+          open,
+          closed,
+          ...(gone === undefined ? {} : { gone }),
+        }),
+      );
     expect(s(["a", "b"], ["c"])).not.toBeNull();
     expect(s(["a", "a"], [])).toBeNull();
     expect(s([], ["a", "a"])).toBeNull();
     expect(s(["a"], ["a"])).toBeNull();
+    expect(s(["a"], ["b", "c"], ["b"])).not.toBeNull();
+    expect(s(["a"], ["b", "c"], ["b", "c"])).not.toBeNull();
+    expect(s([], ["b"], [])).not.toBeNull();
+    expect(s(["a"], ["b"], ["c"])).toBeNull();
+    expect(s(["a"], ["b"], ["a"])).toBeNull();
+    expect(s([], [], ["a"])).toBeNull();
+    expect(s([], ["a"], ["a", "a"])).toBeNull();
     const dv = {
       ...base,
       type: "deliver",
@@ -851,5 +871,46 @@ describe("status frames, and no card frames", () => {
         }),
       ),
     ).toBeNull();
+  });
+});
+
+describe("agent kind antigravity (agy S1a)", () => {
+  const agentUp = (kind: string) =>
+    JSON.stringify({
+      v: 1,
+      id,
+      type: "agent_up",
+      agent_ref: "conv-1",
+      kind,
+      proposed_name: "antigravity",
+      namespace: "a/b",
+      global: false,
+    });
+  const roster = (kind: string) =>
+    JSON.stringify({
+      v: 1,
+      id,
+      type: "roster",
+      agents: [
+        { bus_name: "n", kind, namespace: "a/b", global: false, state: "live" },
+      ],
+    });
+
+  it("the hub accepts an agent_up of kind antigravity", () => {
+    expect(okc(agentUp("antigravity"))).toMatchObject({
+      type: "agent_up",
+      kind: "antigravity",
+    });
+  });
+
+  it("a reader from before the kind takes its roster row by its own token", () => {
+    // A reader whose kind list predates antigravity: it refuses the kind as a writer...
+    const older = z.enum(AGENT_KINDS.filter((k) => k !== "antigravity"));
+    expect(older.safeParse("antigravity").success).toBe(false);
+    // ...but roster rows carry any kind token, so the row parses and keeps it.
+    expect(KindTokenSchema.parse("antigravity")).toBe("antigravity");
+    expect(oks(roster("antigravity"))).toMatchObject({
+      agents: [{ kind: "antigravity" }],
+    });
   });
 });

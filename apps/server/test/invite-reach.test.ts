@@ -6,7 +6,6 @@
 import { env } from "cloudflare:workers";
 import {
   INVITE_UNREACHABLE_MESSAGE,
-  InviteUnreachableDetailsSchema,
   MemberInviteResultSchema,
   R,
 } from "@oa/shared";
@@ -51,28 +50,23 @@ function install(make: (o: Partial<Env>) => Env, over: Partial<Env> = {}) {
 const owner = async () => (await login(uniq("own", "x.com"), "owner")).cookie;
 
 describe("invite reachability (review item 11)", () => {
+  // #3184: every invited row may sign in by code at its exact address, so
+  // with codes on an invite is never unreachable for want of a code.
   it.each([
-    ["member", "outside_domains", "out.com"],
-    ["admin", "outside_domains", "out.com"],
-    ["member", "no_sign_in_method", "a.com"],
+    ["member", "out.com"],
+    ["admin", "out.com"],
+    ["member", "a.com"],
   ] as const)(
-    "email codes only, domain codes off: a %s at %s is 400 invite_unreachable (%s), nothing created",
-    async (role, reason, domain) => {
+    "email codes only, domain codes off: a %s at %s is invited and the email promises a code",
+    async (role, domain) => {
       const { e, sent } = install(direct, { AUTH_PROVIDERS: "email" });
-      const cookie = await owner();
-      const email = uniq("nope", domain);
-      const r = await invite(e, cookie, email, role);
-      expect(r.status).toBe(400);
-      const err = await errOf(r);
-      expect(err.code).toBe("invite_unreachable");
-      expect(InviteUnreachableDetailsSchema.parse(err.details)).toEqual({
-        field: "email",
-        reason,
-      });
-      expect(err.message).toBe(INVITE_UNREACHABLE_MESSAGE[reason]);
-      expect(err.message).not.toContain("—");
-      expect(await rowOf(email)).toBeNull();
-      expect(sent).toHaveLength(0);
+      const email = uniq("code", domain);
+      const r = await invite(e, await owner(), email, role);
+      expect(r.status).toBe(201);
+      const body = MemberInviteResultSchema.parse(await r.json());
+      expect(body.signInMethods).toEqual(["email"]);
+      expect(await rowOf(email)).not.toBeNull();
+      namesExactly(sent[0]?.text, ["email"]);
     },
   );
 
@@ -113,18 +107,15 @@ describe("invite reachability (review item 11)", () => {
     );
   });
 
-  it("Google and email, in-domain: fine, and the email names Google, never a code", async () => {
+  it("Google and email, in-domain: fine, and the email names Google and a code (#3184)", async () => {
     const { e, sent } = install(direct);
     const email = uniq("g", "a.com");
     const r = await invite(e, await owner(), email);
     expect(r.status).toBe(201);
-    expect(
-      MemberInviteResultSchema.parse(await r.json()).signIn,
-    ).toBeUndefined();
-    const m = sent[0];
-    expect(m?.text).toContain("You'll log in with your Google account.");
-    for (const part of [m?.subject, m?.text, m?.html])
-      expect(part).not.toContain("one-time code");
+    const body = MemberInviteResultSchema.parse(await r.json());
+    expect(body.signIn).toBeUndefined();
+    expect(body.signInMethods).toEqual(["google", "email"]);
+    namesExactly(sent[0]?.text, ["google", "email"]);
   });
 
   it.each([
@@ -142,7 +133,10 @@ describe("invite reachability (review item 11)", () => {
   ] as const)(
     "%s, Google with AUTH_DOMAINS, outside the domains: created, signIn uncertain",
     async (_, over) => {
-      const { e, sent } = install(direct, over as Partial<Env>);
+      const { e, sent } = install(direct, {
+        ...(over as Partial<Env>),
+        AUTH_PROVIDERS: "google",
+      });
       const email = uniq("sec", "secondary.com");
       const r = await invite(e, await owner(), email);
       expect(r.status).toBe(201);
@@ -157,6 +151,17 @@ describe("invite reachability (review item 11)", () => {
     },
   );
 
+  it("Google and email, outside the domains: no uncertain flag, the email names Google and a code", async () => {
+    const { e, sent } = install(direct, {});
+    const email = uniq("nog", "secondary.com");
+    const r = await invite(e, await owner(), email);
+    expect(r.status).toBe(201);
+    const body = MemberInviteResultSchema.parse(await r.json());
+    expect(body.signIn).toBeUndefined();
+    expect(body.signInMethods).toEqual(["google", "email"]);
+    namesExactly(sent[0]?.text, ["google", "email"]);
+  });
+
   it("Google with AUTH_DOMAINS: an invited Gmail address is certain (no uncertain flag, #2520)", async () => {
     const { e, sent } = install(direct, {});
     const email = uniq("pal", "gmail.com");
@@ -165,7 +170,8 @@ describe("invite reachability (review item 11)", () => {
     expect(
       MemberInviteResultSchema.parse(await r.json()).signIn,
     ).toBeUndefined();
-    expect(sent[0]?.text).toContain("You'll log in with your Google account.");
+    expect(sent[0]?.text).toContain("your Google account");
+    expect(sent[0]?.text).toContain("one-time code");
   });
 
   it("re-inviting an invited, never-signed-in row is a 200 (fresh clock); anything else stays 409", async () => {
@@ -256,11 +262,18 @@ function namesExactly(text: string | undefined, methods: readonly string[]) {
 describe("MemberInviteResult.signInMethods (#799)", () => {
   it.each([
     ["trial, in-domain", trial, {}, "a.com", ["email"]],
-    ["Google and email, in-domain", direct, {}, "a.com", ["google"]],
+    ["Google and email, in-domain", direct, {}, "a.com", ["google", "email"]],
     [
-      "Google and email, outside (uncertain)",
+      "Google and email, outside (uncertain Google, a code)",
       direct,
       {},
+      "out.com",
+      ["google", "email"],
+    ],
+    [
+      "Google only, outside (uncertain)",
+      direct,
+      { AUTH_PROVIDERS: "google" },
       "out.com",
       ["google"],
     ],
@@ -269,7 +282,7 @@ describe("MemberInviteResult.signInMethods (#799)", () => {
       direct,
       { AUTH_PROVIDERS: "access,google,email" },
       "a.com",
-      ["google", "access"],
+      ["google", "access", "email"],
     ],
     [
       "Access only",
