@@ -2635,4 +2635,210 @@ describe("delegated asks with for and subject", () => {
     expect(sent.map((x) => x.notice.to.name)).not.toContain("Claude");
     expect(sent.map((x) => x.notice.to.name)).not.toContain("Bystander");
   });
+
+  it("accepts a role key of the asker's own user on the roster, stores the holder's identity, refuses vacant/away/other-member roles, and keeps yes with the first holder after re-pointing", async () => {
+    const s = await setup();
+    const roleId = newId();
+    const vacantRoleId = newId();
+    const awayRoleId = newId();
+    const editorRoleId = newId();
+
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-RoleHolder1",
+      namespace: "ns-owner",
+      name: "RoleHolder1",
+      role: "Maintainer",
+      roleId,
+    });
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-RoleHolder2",
+      namespace: "ns-owner",
+      name: "RoleHolder2",
+    });
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-AwayHolder",
+      namespace: "ns-owner",
+      name: "AwayHolder",
+      state: "away",
+      running: false,
+      role: "AwayRole",
+      roleId: awayRoleId,
+    });
+    hubs.set({
+      owner: editor.userId,
+      identityId: "id-ns-editor-EditorRoleHolder",
+      namespace: "ns-editor",
+      name: "EditorRoleHolder",
+      role: "EditorRole",
+      roleId: editorRoleId,
+    });
+    await follow(
+      E,
+      editor.userId,
+      { namespace: "ns-editor", name: "EditorRoleHolder" },
+      s.id,
+    );
+    hubs.setRole({
+      id: roleId,
+      owner: owner.userId,
+      namespace: "ns-owner",
+      name: "Maintainer",
+      agentId: "id-ns-owner-RoleHolder1",
+    });
+    hubs.setRole({
+      id: vacantRoleId,
+      owner: owner.userId,
+      namespace: "ns-owner",
+      name: "VacantRole",
+      agentId: null,
+    });
+    hubs.setRole({
+      id: awayRoleId,
+      owner: owner.userId,
+      namespace: "ns-owner",
+      name: "AwayRole",
+      agentId: "id-ns-owner-AwayHolder",
+    });
+
+    const roster = (await (
+      await api(app, R.artifactAgents(s.id), owner.cookie)
+    ).json()) as ArtifactAgent[];
+    const maintainerKey = roster.find((a) => a.name === "Maintainer")?.key;
+    const vacantKey = roster.find((a) => a.name === "VacantRole")?.key;
+    const awayKey = roster.find((a) => a.name === "AwayRole")?.key;
+    const editorRoleKey = roster.find(
+      (a) => a.owner !== null && a.name.startsWith("EditorRole"),
+    )?.key;
+    expect(maintainerKey).toMatch(/^role:/);
+    expect(vacantKey).toMatch(/^role:/);
+    expect(awayKey).toMatch(/^role:/);
+    expect(editorRoleKey).toMatch(/^role:/);
+
+    const art = { id: s.id, format: "html", currentVersion: 1 } as never;
+    const subject = "outcomeeng/open-artifacts@cc4897cd";
+    const postWithFor = (key: string) =>
+      addThread(
+        E,
+        art,
+        agentOf(owner, "Claude", "ns-owner"),
+        view(owner),
+        {
+          anchor: NOTE,
+          body: "Approve?",
+          ask: {
+            question: "Close #1117 Applied?",
+            options: OPTS,
+            to: [{ key: owner.userId }],
+            for: [{ key }],
+            subject,
+          },
+        },
+        { moderator: true },
+      );
+
+    // Vacant role, away/non-running role holder, and another member's role are all refused.
+    await expect(postWithFor(vacantKey as string)).rejects.toMatchObject({
+      code: "bad_request",
+    });
+    await expect(postWithFor(awayKey as string)).rejects.toMatchObject({
+      code: "bad_request",
+    });
+    await expect(postWithFor(editorRoleKey as string)).rejects.toMatchObject({
+      code: "bad_request",
+    });
+
+    // Held role of the asker's own user is accepted and stores the holder's identity.
+    const t = await postWithFor(maintainerKey as string);
+    const cid = (t.comments[0] as Comment).id;
+
+    const storedForJson = await runInDurableObject(
+      runtimeStub(E, s.id) as unknown as DurableObjectStub<ArtifactRuntime>,
+      (_i, state) =>
+        state.storage.sql
+          .exec<{ for_agents: string | null }>(
+            "select for_agents from comment_asks where comment_id = ?",
+            cid,
+          )
+          .one().for_agents,
+    );
+    expect(storedForJson).toBeTruthy();
+    const storedFor = JSON.parse(storedForJson as string) as Array<{
+      kind: string;
+      key: string;
+      name: string;
+      owner: string;
+      namespace: string;
+      identity?: { identityId: string; kind: string };
+    }>;
+    expect(storedFor).toHaveLength(1);
+    expect(storedFor[0]).toMatchObject({
+      kind: "agent",
+      name: "RoleHolder1",
+      owner: owner.userId,
+      namespace: "ns-owner",
+      identity: { identityId: "id-ns-owner-RoleHolder1", kind: "x" },
+    });
+    expect(storedFor[0]?.key).toMatch(/^agent:/);
+
+    // Re-point the role from RoleHolder1 to RoleHolder2 before the answer is picked.
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-RoleHolder1",
+      namespace: "ns-owner",
+      name: "RoleHolder1",
+    });
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-RoleHolder2",
+      namespace: "ns-owner",
+      name: "RoleHolder2",
+      role: "Maintainer",
+      roleId,
+    });
+    hubs.setRole({
+      id: roleId,
+      owner: owner.userId,
+      namespace: "ns-owner",
+      name: "Maintainer",
+      agentId: "id-ns-owner-RoleHolder2",
+    });
+
+    bus.clear();
+    expect((await answer(s.id, t.id, cid, owner, "wide")).status).toBe(200);
+
+    const yesFor = async (name: string, identityId: string) => {
+      const l = await listComments(E, s.id, "all", {
+        userId: owner.userId,
+        short: null,
+        agent: {
+          name,
+          version: null,
+          identity: {
+            identityId,
+            namespace: "ns-owner",
+            name,
+            kind: "x",
+          },
+        },
+      });
+      return l.threads
+        .find((x) => x.id === t.id)
+        ?.comments.find((c) => c.id === cid)?.ask?.answer?.yes;
+    };
+
+    expect(await yesFor("RoleHolder1", "id-ns-owner-RoleHolder1")).toBe(true);
+    expect(await yesFor("RoleHolder2", "id-ns-owner-RoleHolder2")).toBe(false);
+    expect(await yesFor("Claude", "id-ns-owner-Claude")).toBe(false);
+
+    const sent = answered();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.notice.toIdentity).toBe("id-ns-owner-RoleHolder1");
+    expect(sent[0]?.notice.to).toEqual({
+      namespace: "ns-owner",
+      name: "RoleHolder1",
+    });
+  });
 });
