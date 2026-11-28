@@ -2450,27 +2450,36 @@ async function resolveExtras(
         "bad_request",
         "An ask that names an action goes to you only: drop the other people",
       );
-    // outcomeeng: `for` names agents of the asker's own user on the roster (no roles),
-    // fixed to their identity at post time in withIdentities.
+    // outcomeeng: `for` names agents of the asker's own user on the roster
+    // (including a role currently held by a running agent of that user, resolved
+    // to its holder at post time), fixed to their identity in withIdentities.
     let forAgents: StoredForAgent[] | undefined;
     if (askIn.for) {
       forAgents = [];
       for (const { key } of askIn.for) {
-        if (forAgents.some((p) => p.key === key)) continue;
-        if (roleIdFromKey(key))
-          throw new ApiError(
-            "bad_request",
-            `\`for\` must name an agent of your own user on this artifact: ${key}`,
-          );
         const a = await find(key);
         if (!a || a.userId !== askerId)
           throw new ApiError(
             "bad_request",
             `\`for\` must name an agent of your own user on this artifact: ${key}`,
           );
+        const isRole = roleIdFromKey(key) !== undefined;
+        const address = isRole ? a.holderAddress : a.address;
+        if (!address)
+          throw new ApiError(
+            "bad_request",
+            `\`for\` must name an agent of your own user on this artifact: ${key}`,
+          );
+        const entryKey = isRole
+          ? await agentKey(artifactId, askerId, address)
+          : a.key;
+        if (forAgents.some((p) => p.key === entryKey)) continue;
         forAgents.push({
-          ...storedAgent(a),
-          namespace: a.address.namespace,
+          kind: "agent",
+          key: entryKey,
+          name: address.name,
+          owner: askerId,
+          namespace: address.namespace,
         });
       }
     }

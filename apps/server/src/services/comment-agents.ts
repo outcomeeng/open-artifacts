@@ -40,6 +40,8 @@ export type RosterAgent = ArtifactAgent & {
   /** The member whose agent it is. */
   userId: string;
   address: BusAddress;
+  /** outcomeeng: for a role entry whose holder is running, the holder agent's bus address. */
+  holderAddress?: BusAddress;
   /** #2238: the verified identity the address was resolved to; a notice then goes only to it. */
   identityId?: string;
   /** #3132: when the subject began (a thread reply: when the agent joined), BusNotice.originAt. */
@@ -100,6 +102,9 @@ async function rosterEntry(
     owner,
     userId,
     address: role ? { namespace: address.namespace, name: role.name } : address,
+    ...(role && a?.running
+      ? { holderAddress: { namespace: a.namespace, name: a.name } }
+      : {}),
   };
 }
 
@@ -241,6 +246,14 @@ export async function viewerAgents(
         ? {
             ...sessionOf(holder, true),
             ...(holder.privateSessionName ? {} : { session: holder.name }),
+            ...(!role.vacant && holder.running
+              ? {
+                  holderAddress: {
+                    namespace: holder.namespace,
+                    name: holder.name,
+                  },
+                }
+              : {}),
           }
         : { ...UNKNOWN, state: "away" as const }),
     });

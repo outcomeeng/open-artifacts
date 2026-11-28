@@ -21,6 +21,7 @@ import {
   daemon,
   e,
   hello,
+  hubOf,
   machine,
   member,
   ns,
@@ -249,5 +250,180 @@ describe("answer.yes over MCP (#2224)", () => {
       { threadId, commentId, optionId: "merge", yes: false },
     ]);
     expect(await catchUp(agentC)).toEqual([]);
+  });
+
+  it("with ask.for naming a role key: refuses a vacant role, accepts a held role, and keeps yes with the first holder after re-pointing", async () => {
+    const m = await member();
+    const user = (await getUser(e, m.userId)) as Member;
+    const mach = await machine("Laptop", m.userId);
+    const d = await daemon(mach.token);
+    try {
+      d.send({ ...hello("h3"), caps: [BUS_CAPS.link] } as never);
+      await waitFor(d, "hello_ok");
+      const space = ns("for-role");
+      const proofs = [proofOf(), proofOf(), proofOf()];
+      const names = ["AskerR", "Holder1", "Holder2"] as const;
+      for (const [i, proof] of proofs.entries()) {
+        d.send(up(`ur${i}`, `refr${i}`, names[i] as string, space));
+        await waitFor(d, "agent_ok");
+        d.send({
+          v: 1,
+          id: `br${i}`,
+          type: "link_bind",
+          agent_ref: `refr${i}`,
+          hash: await sha256Hex(proof),
+        } as never);
+        await waitFor(d, "link_bound");
+      }
+
+      const hub = await hubOf(m.userId);
+      const idOf = async (name: string) =>
+        (await hub.snapshot()).agents.find((a) => a.name === name)?.id ?? "";
+      const holder1Id = await idOf("Holder1");
+      const holder2Id = await idOf("Holder2");
+      expect(holder1Id).not.toBe("");
+      expect(holder2Id).not.toBe("");
+
+      const putRole = (name: string, agentId: string | null) =>
+        api(app, R.busRoles, m.cookie, {
+          method: "PUT",
+          body: { namespace: space, name, agentId },
+        });
+      expect((await putRole("Maintainer", holder1Id)).status).toBe(200);
+      expect((await putRole("VacantRole", null)).status).toBe(200);
+
+      const { token } = await createPat(e, m.userId, "for-role");
+      const asker = await connect(token, {
+        headers: { [LINK_PROOF_HEADER]: proofs[0] as string },
+      });
+      const holder1 = await connect(token, {
+        headers: { [LINK_PROOF_HEADER]: proofs[1] as string },
+      });
+      const holder2 = await connect(token, {
+        headers: { [LINK_PROOF_HEADER]: proofs[2] as string },
+      });
+      const unlinked = await connect(token);
+      clients.push(asker, holder1, holder2, unlinked);
+
+      const id = (
+        await publish(
+          E(),
+          user,
+          {
+            title: "doc",
+            format: "html",
+            content: "<p>Role-key delegated approval check</p>",
+            comments: "everyone",
+          } as never,
+          null,
+          undefined,
+          "create",
+        )
+      ).id;
+
+      const roster = (await (
+        await api(app, R.artifactAgents(id), m.cookie)
+      ).json()) as ArtifactAgent[];
+      const maintainerKey = roster.find((a) => a.name === "Maintainer")?.key;
+      const vacantKey = roster.find((a) => a.name === "VacantRole")?.key;
+      expect(maintainerKey).toMatch(/^role:/);
+      expect(vacantKey).toMatch(/^role:/);
+
+      const subject = "close outcomeeng/changes#1117 Applied at main cc4897cd";
+
+      // A vacant role has no holder and is refused.
+      const refused = await tool(asker, "add_comment", {
+        id,
+        body: "Close vacant?",
+        ask: {
+          question: "Close #1117?",
+          options: [
+            { id: "close", label: "Close Applied" },
+            { id: "hold", label: "Hold" },
+          ],
+          to: [{ key: m.userId }],
+          for: [{ key: vacantKey as string }],
+          subject,
+        },
+      });
+      expect(refused.isError).toBe(true);
+
+      // A role held by a running agent of the member is accepted.
+      const beforeAnswer = new Date(Date.now() - 1000).toISOString();
+      const made = await tool(asker, "add_comment", {
+        id,
+        body: "Ready to close #1117?",
+        ask: {
+          question: "Close #1117 Applied?",
+          options: [
+            { id: "close", label: "Close Applied" },
+            { id: "hold", label: "Hold" },
+          ],
+          to: [{ key: m.userId }],
+          for: [{ key: maintainerKey as string }],
+          subject,
+        },
+      });
+      expect(made.isError, JSON.stringify(made.content)).toBeFalsy();
+      const { threadId, commentId } = made.structuredContent as {
+        threadId: string;
+        commentId: string;
+      };
+
+      // Re-point the role to Holder2 after posting: the yes stays with Holder1.
+      expect((await putRole("Maintainer", holder2Id)).status).toBe(200);
+
+      const res = await api(
+        app,
+        R.commentAnswer(id, threadId, commentId),
+        m.cookie,
+        {
+          method: "POST",
+          body: { optionId: "close" },
+        },
+      );
+      expect(res.status).toBe(200);
+
+      const readAsk = async (c: typeof asker) => {
+        const r = await tool(c, "list_comments", { id });
+        expect(r.isError).toBeFalsy();
+        const list = r.structuredContent as CommentList;
+        return list.threads[0]?.comments[0]?.ask;
+      };
+
+      const seenByHolder1 = await readAsk(holder1);
+      expect(seenByHolder1?.subject).toBe(subject);
+      expect(seenByHolder1?.answer?.optionId).toBe("close");
+      expect(seenByHolder1?.answer?.yes).toBe(true);
+
+      const seenByHolder2 = await readAsk(holder2);
+      expect(seenByHolder2?.answer?.optionId).toBe("close");
+      expect(seenByHolder2?.answer?.yes).toBe(false);
+
+      const seenByAsker = await readAsk(asker);
+      expect(seenByAsker?.answer?.optionId).toBe("close");
+      expect(seenByAsker?.answer?.yes).toBe(false);
+
+      expect((await readAsk(unlinked))?.answer?.yes).toBe(false);
+
+      const catchUp = async (c: typeof asker) => {
+        const r = await tool(c, "list_comments", {
+          id,
+          answeredSince: beforeAnswer,
+          compact: true,
+        });
+        expect(r.isError).toBeFalsy();
+        return (r.structuredContent as CompactCommentList).answers ?? [];
+      };
+      expect(await catchUp(holder1)).toMatchObject([
+        { threadId, commentId, optionId: "close", yes: true },
+      ]);
+      expect(await catchUp(asker)).toMatchObject([
+        { threadId, commentId, optionId: "close", yes: false },
+      ]);
+      expect(await catchUp(holder2)).toEqual([]);
+    } finally {
+      d.close();
+    }
   });
 });
