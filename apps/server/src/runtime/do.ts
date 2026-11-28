@@ -705,6 +705,16 @@ export class ArtifactRuntime extends DurableObject<Env> {
           .some((c) => c.name === "withdrawn")
       )
         sql.exec("alter table comment_asks add column withdrawn text");
+      // outcomeeng: comment_asks.for_agents and subject, for DOs created before them.
+      const askCols = sql
+        .exec<{ name: string }>(
+          "select name from pragma_table_info('comment_asks')",
+        )
+        .toArray();
+      if (!askCols.some((c) => c.name === "for_agents"))
+        sql.exec("alter table comment_asks add column for_agents text");
+      if (!askCols.some((c) => c.name === "subject"))
+        sql.exec("alter table comment_asks add column subject text");
       if (!pcols.some((c) => c.name === "removed"))
         sql.exec(
           "alter table comment_participants add column removed integer not null default 0",

@@ -49,6 +49,7 @@ import {
   type StoredAgent,
   type StoredAsk,
   type StoredComment,
+  type StoredForAgent,
   type StoredIdentity,
   type StoredParticipant,
   type StoredParty,
@@ -238,6 +239,28 @@ const askedByViewer = (c: StoredComment, viewer: CommentViewer): boolean => {
     mine.name === viewer.agent.name &&
     mine.via === (viewer.agent.via ? viaKey(viewer.agent.via) : null)
   );
+};
+
+/**
+ * outcomeeng: whether `viewer` may take an answer on this ask as its `yes`:
+ * when `for` is set, only an agent `for` names, matched by identity;
+ * without `for`, unchanged (`askedByViewer`).
+ */
+const yesTargetForViewer = (
+  c: StoredComment,
+  viewer: CommentViewer,
+): boolean => {
+  if (c.ask?.for?.length) {
+    const vid = viewer.agent?.identity?.identityId;
+    return (
+      vid !== undefined &&
+      viewer.userId !== null &&
+      c.ask.for.some(
+        (p) => p.owner === viewer.userId && p.identity?.identityId === vid,
+      )
+    );
+  }
+  return askedByViewer(c, viewer);
 };
 
 /** Anonymous, guest-role, or capped to guest or restricted: never wakes an agent without an @. */
@@ -590,7 +613,8 @@ const hasAgent = (c: StoredComment): boolean =>
   !!c.mentions?.length ||
   !!c.notified?.length ||
   !!c.ask?.answer?.by.agent ||
-  !!c.ask?.to.some((p) => p.kind === "agent");
+  !!c.ask?.to.some((p) => p.kind === "agent") ||
+  !!c.ask?.for?.length;
 
 async function ctxFor(
   env: Env,
@@ -653,6 +677,7 @@ export async function currentNames(
     for (const m of c.notified ?? []) add(m.owner, m.identity?.identityId);
     for (const p of c.ask?.to ?? [])
       if (p.kind === "agent") add(p.owner, p.identity?.identityId);
+    for (const p of c.ask?.for ?? []) add(p.owner, p.identity?.identityId);
   }
   const out = new Map<string, AgentFaceRow>();
   const now = Date.now();
@@ -962,6 +987,7 @@ function userIds(c: StoredComment, into: Set<string>): void {
   if (c.askedBy) into.add(c.askedBy.userId);
   if (!c.ask) return;
   for (const p of c.ask.to) into.add(p.kind === "user" ? p.key : p.owner);
+  for (const p of c.ask.for ?? []) into.add(p.owner);
   if (c.ask.answer?.by.kind === "user") into.add(c.ask.answer.by.ref);
   if (c.ask.decider) into.add(c.ask.decider);
   for (const p of c.ask.history ?? [])
@@ -1210,20 +1236,21 @@ const commentOfRaw = (
       users.clash,
     ),
   );
-  const asked = (c.ask?.to ?? []).flatMap((p): [string, string][] =>
-    p.kind === "agent"
-      ? [
-          [
-            p.name,
-            agentName(
-              currentName(p, users),
-              users.users.get(p.owner),
-              viewer,
-              users.clash,
-            ),
-          ],
-        ]
-      : [],
+  const asked = [...(c.ask?.to ?? []), ...(c.ask?.for ?? [])].flatMap(
+    (p): [string, string][] =>
+      p.kind === "agent"
+        ? [
+            [
+              p.name,
+              agentName(
+                currentName(p, users),
+                users.users.get(p.owner),
+                viewer,
+                users.clash,
+              ),
+            ],
+          ]
+        : [],
   );
   const pairs: [string, string][] = [
     ...(c.mentions ?? []).map((m, i): [string, string] => [
@@ -1262,6 +1289,16 @@ const commentOfRaw = (
                 }
               : {}),
             to: c.ask.to.map((p) => partyView(p, viewer, users, c.createdAt)),
+            ...(c.ask.for?.length
+              ? {
+                  for: c.ask.for.map((p) =>
+                    partyView(p, viewer, users, c.createdAt),
+                  ),
+                }
+              : {}),
+            ...(c.ask.subject !== undefined
+              ? { subject: maskBody(c.ask.subject, pairs) }
+              : {}),
             ...(c.ask.confirm ? { confirm: c.ask.confirm } : {}),
             ...(c.ask.replaces ? { replaces: c.ask.replaces } : {}),
             ...(c.ask.replacedBy ? { replacedBy: c.ask.replacedBy } : {}),
@@ -1309,7 +1346,7 @@ const commentOfRaw = (
                       c.ask.answer.by.ref === viewer.userId &&
                       c.author.kind === "user" &&
                       c.author.ref === viewer.userId &&
-                      askedByViewer(c, viewer),
+                      yesTargetForViewer(c, viewer),
                   },
                 }
               : {}),
@@ -1496,6 +1533,16 @@ const mentionsCaller = (c: StoredComment, viewer: CommentViewer): boolean => {
   });
 };
 
+/** outcomeeng: this ask names the viewer's linked agent in `for`. */
+const forCaller = (c: StoredComment, viewer: CommentViewer): boolean => {
+  if (viewer.userId === null || !c.ask?.for?.length) return false;
+  const vid = viewer.agent?.identity?.identityId;
+  if (!vid) return false;
+  return c.ask.for.some(
+    (p) => p.owner === viewer.userId && p.identity?.identityId === vid,
+  );
+};
+
 const answeredHit = (
   c: StoredComment,
   viewer: CommentViewer,
@@ -1503,7 +1550,7 @@ const answeredHit = (
 ): boolean =>
   c.ask?.answer !== undefined &&
   after(c.ask.answer.at, since) &&
-  askedByCaller(c, viewer);
+  (askedByCaller(c, viewer) || forCaller(c, viewer));
 
 const mentionHit = (
   c: StoredComment,
@@ -2124,12 +2171,38 @@ async function resolveExtras(
         "bad_request",
         "An ask that names an action goes to you only: drop the other people",
       );
+    // outcomeeng: `for` names agents of the asker's own user on the roster (no roles),
+    // fixed to their identity at post time in withIdentities.
+    let forAgents: StoredForAgent[] | undefined;
+    if (askIn.for) {
+      forAgents = [];
+      for (const { key } of askIn.for) {
+        if (forAgents.some((p) => p.key === key)) continue;
+        if (roleIdFromKey(key))
+          throw new ApiError(
+            "bad_request",
+            `\`for\` must name an agent of your own user on this artifact: ${key}`,
+          );
+        const a = await find(key);
+        if (!a || a.userId !== askerId)
+          throw new ApiError(
+            "bad_request",
+            `\`for\` must name an agent of your own user on this artifact: ${key}`,
+          );
+        forAgents.push({
+          ...storedAgent(a),
+          namespace: a.address.namespace,
+        });
+      }
+    }
     // #2864: no ask needs a passkey for now, so the server sets no `confirm`.
     ask = {
       question: askIn.question,
       options: askIn.options,
       ...(askIn.recommended ? { recommended: askIn.recommended } : {}),
       to,
+      ...(forAgents?.length ? { for: forAgents } : {}),
+      ...(askIn.subject !== undefined ? { subject: askIn.subject } : {}),
       ...(decider ? { decider } : {}),
       ...(typeof askIn.replaces === "string"
         ? { replaces: askIn.replaces }
@@ -2371,7 +2444,8 @@ async function deliver(
  */
 async function withIdentities(env: Env, r: Resolved): Promise<Resolved> {
   const x = r.extras;
-  if (!x || (r.agents.length === 0 && !x.held?.length)) return r;
+  if (!x || (r.agents.length === 0 && !x.held?.length && !x.ask?.for?.length))
+    return r;
   // Held agents too (#2577): their hold keeps the identity the release proves.
   const byKey = new Map<string, { userId: string; address: BusAddress }>();
   for (const { agent: a } of x.held ?? [])
@@ -2379,6 +2453,12 @@ async function withIdentities(env: Env, r: Resolved): Promise<Resolved> {
       userId: a.owner,
       address: { namespace: a.namespace, name: a.name },
     });
+  for (const p of x.ask?.for ?? [])
+    if (p.namespace)
+      byKey.set(p.key, {
+        userId: p.owner,
+        address: { namespace: p.namespace, name: p.name },
+      });
   for (const { agent: a } of r.agents) byKey.set(a.key, a);
   const keys = [...byKey.keys()];
   const found = await Promise.all(
@@ -2416,6 +2496,7 @@ async function withIdentities(env: Env, r: Resolved): Promise<Resolved> {
             ask: {
               ...x.ask,
               to: x.ask.to.map((p) => (p.kind === "agent" ? put(p) : p)),
+              ...(x.ask.for ? { for: x.ask.for.map(put) } : {}),
             },
           }
         : {}),
@@ -2642,6 +2723,67 @@ export async function askingAddress(
   const at = await agentIdentityOf(env, row.owner, address);
   if (at?.identityId !== id.identityId) return none("name_not_theirs");
   return { ...address, identityId: id.identityId, ...originAt };
+}
+
+/**
+ * outcomeeng: resolves the verified bus address of each agent named in
+ * `ask.for`, failing closed per agent on any miss, mismatch or hub error.
+ */
+async function forAddresses(
+  env: Env,
+  artifactId: string,
+  threadId: string,
+  ownerId: string,
+  forAgents: readonly StoredForAgent[],
+  askedAt?: string,
+): Promise<AskerAddress[]> {
+  const origin = askedAt ? Date.parse(askedAt) : Number.NaN;
+  const originAt = Number.isFinite(origin) ? { originAt: origin } : {};
+  const valid = forAgents.filter(
+    (
+      p,
+    ): p is StoredForAgent & { identity: StoredIdentity; namespace: string } =>
+      p.owner === ownerId && !!p.identity?.identityId && !!p.namespace,
+  );
+  if (valid.length === 0) return [];
+  const names = await agentNamesOf(
+    env,
+    ownerId,
+    valid.map((p) => p.identity.identityId),
+  );
+  const out: AskerAddress[] = [];
+  for (const p of valid) {
+    const id = p.identity.identityId;
+    const current = names.get(id);
+    if (!current) {
+      logInfo("ask_for_unresolved", {
+        artifactId,
+        threadId,
+        reason: "no_current_name",
+      });
+      continue;
+    }
+    const address = { namespace: p.namespace, name: current };
+    if (!BusAddressSchema.safeParse(address).success) {
+      logInfo("ask_for_unresolved", {
+        artifactId,
+        threadId,
+        reason: "bad_address",
+      });
+      continue;
+    }
+    const at = await agentIdentityOf(env, p.owner, address);
+    if (at?.identityId !== id) {
+      logInfo("ask_for_unresolved", {
+        artifactId,
+        threadId,
+        reason: "name_not_theirs",
+      });
+      continue;
+    }
+    out.push({ ...address, identityId: id, ...originAt });
+  }
+  return out;
 }
 
 /** #2733: lets go of the holds a reply took up front; retried once. False when it failed (they stay held: masked, undelivered). Logs a fixed event, no content. Never throws. */
@@ -3179,7 +3321,17 @@ export async function answerAsk(
       await noteMemberFirst(env, who.id, "first_ask_answered", after?.ctx);
   // The answer is stored: the asker's following agents hear of it, in the
   // background, and a failure never fails the answer (inBackground catches).
-  if (after && !unchanged && c.author.kind === "user")
+  if (after && !unchanged && c.author.kind === "user") {
+    const targets = c.ask?.for?.length
+      ? await forAddresses(
+          env,
+          artifactId,
+          threadId,
+          c.author.ref,
+          c.ask.for,
+          c.createdAt,
+        )
+      : await askingAddress(env, artifactId, threadId, c.author, c.createdAt);
     await inBackground(
       after.ctx,
       notifyAnswered(
@@ -3189,7 +3341,7 @@ export async function answerAsk(
         threadId,
         commentId,
         c.author.ref,
-        await askingAddress(env, artifactId, threadId, c.author, c.createdAt),
+        targets,
         // Only an answer the asker picked themselves in the web app.
         decided &&
           c.ask?.answer !== undefined &&
@@ -3204,8 +3356,10 @@ export async function answerAsk(
           c.ask.answer.by.ref === c.author.ref
           ? ownWords
           : undefined,
+        c.ask?.subject,
       ),
     );
+  }
   return commentView(env, c, viewer);
 }
 

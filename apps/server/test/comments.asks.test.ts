@@ -1,6 +1,8 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import {
+  ASK_FOR_MAX,
+  ASK_SUBJECT_MAX,
   type ArtifactAgent,
   AskInputSchema,
   type BusNotice,
@@ -2366,5 +2368,271 @@ describe("own words in the ask_answered notice (#2895)", () => {
       body: { ownWords: { text: "secret weigh-in" } },
     });
     expect(JSON.stringify(answered())).not.toContain("secret weigh-in");
+  });
+});
+
+describe("delegated asks with for and subject", () => {
+  const real = E;
+  const rows: string[] = [];
+  beforeAll(async () => {
+    E = hubs.env();
+    for (const u of [owner, editor])
+      rows.push(await connectedMachine(E.DB, u.userId));
+  });
+  afterAll(async () => {
+    E = real;
+    for (const id of rows)
+      await real.DB.prepare("delete from bus_machines where id = ?")
+        .bind(id)
+        .run();
+  });
+  const answered = () =>
+    bus.sent.filter((x) => x.notice.kind === "ask_answered");
+
+  it("refuses invalid for keys, missing subject, 11 for agents, and 201-char subject", async () => {
+    const s = await setup();
+    const art = { id: s.id, format: "html", currentVersion: 1 } as never;
+    const postAsk = (askObj: Record<string, unknown>) =>
+      addThread(
+        E,
+        art,
+        agentOf(owner, "Claude", "ns-owner"),
+        view(owner),
+        {
+          anchor: NOTE,
+          body: "Check?",
+          ask: {
+            question: "Proceed?",
+            options: OPTS,
+            to: [{ key: owner.userId }],
+            ...askObj,
+          } as never,
+        },
+        { moderator: true },
+      );
+
+    // Schema bounds: missing subject with for, whitespace-only subject, 11 agents, 201 chars.
+    await expect(
+      postAsk({ for: [{ key: s.claude }] }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+    await expect(
+      postAsk({ for: [{ key: s.claude }], subject: "   " }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+    await expect(
+      postAsk({
+        for: Array.from({ length: ASK_FOR_MAX + 1 }, (_, i) => ({
+          key: `agent:${String(i).padStart(32, "0")}`,
+        })),
+        subject: "Change #1117",
+      }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+    await expect(
+      postAsk({
+        for: [{ key: s.claude }],
+        subject: "x".repeat(ASK_SUBJECT_MAX + 1),
+      }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+
+    // Ownership / roster refusals: unknown key, user id, another member's agent, bus role key.
+    hubs.set({
+      owner: editor.userId,
+      identityId: "id-ns-editor-EditorOnlyBot",
+      namespace: "ns-editor",
+      name: "EditorOnlyBot",
+    });
+    await follow(
+      E,
+      editor.userId,
+      { namespace: "ns-editor", name: "EditorOnlyBot" },
+      s.id,
+    );
+    const roster = (await (
+      await api(app, R.artifactAgents(s.id), owner.cookie)
+    ).json()) as ArtifactAgent[];
+    const editorOnlyKey = roster.find(
+      (a) => a.owner !== null && a.name.startsWith("EditorOnlyBot"),
+    )?.key;
+    expect(editorOnlyKey).toBeDefined();
+
+    await expect(
+      postAsk({
+        for: [{ key: `agent:${"a".repeat(32)}` }],
+        subject: "Change #1117",
+      }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+    await expect(
+      postAsk({ for: [{ key: owner.userId }], subject: "Change #1117" }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+    await expect(
+      postAsk({ for: [{ key: editorOnlyKey }], subject: "Change #1117" }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+    await expect(
+      postAsk({
+        for: [{ key: `role:${"1".repeat(16)}:${"b".repeat(32)}` }],
+        subject: "Change #1117",
+      }),
+    ).rejects.toMatchObject({ code: "bad_request" });
+  });
+
+  it("action ask with for takes only the asker's own user's typed pick and refuses anyone else", async () => {
+    const s = await setup();
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-Actor",
+      namespace: "ns-owner",
+      name: "Actor",
+    });
+    await follow(E, owner.userId, { namespace: "ns-owner", name: "Actor" }, s.id);
+    const list = (await (
+      await api(app, R.artifactAgents(s.id), owner.cookie)
+    ).json()) as ArtifactAgent[];
+    const actorKey = list.find((a) => a.name === "Actor")?.key as string;
+    expect(actorKey).toBeDefined();
+
+    const art = { id: s.id, format: "html", currentVersion: 1 } as never;
+    const actionOpts = [
+      { id: "merge", label: "Merge", action: "merge" as const },
+      { id: "hold", label: "Hold" },
+    ];
+    // Addressing someone other than the asker's own user is still refused on an action ask.
+    await expect(
+      addThread(
+        E,
+        art,
+        agentOf(owner, "Claude", "ns-owner"),
+        view(owner),
+        {
+          anchor: NOTE,
+          body: "Merge?",
+          ask: {
+            question: "Merge PR #2?",
+            options: actionOpts,
+            to: [{ key: editor.userId }],
+            for: [{ key: actorKey }],
+            subject: "outcomeeng/open-artifacts@42f8c7b",
+          },
+        },
+        { moderator: true },
+      ),
+    ).rejects.toMatchObject({ code: "bad_request" });
+
+    // Addressing the asker's own user with `for` succeeds.
+    const t = await addThread(
+      E,
+      art,
+      agentOf(owner, "Claude", "ns-owner"),
+      view(owner),
+      {
+        anchor: NOTE,
+        body: "Merge?",
+        ask: {
+          question: "Merge PR #2?",
+          options: actionOpts,
+          to: [{ key: owner.userId }],
+          for: [{ key: actorKey }],
+          subject: "outcomeeng/open-artifacts@42f8c7b",
+        },
+      },
+      { moderator: true },
+    );
+    const cid = (t.comments[0] as Comment).id;
+
+    // Picks by anyone else are refused.
+    expect((await answer(s.id, t.id, cid, editor, "merge")).status).toBe(403);
+    expect((await answer(s.id, t.id, cid, viewer, "merge")).status).toBe(403);
+    expect((await answer(s.id, t.id, cid, stranger, "merge")).status).toBe(404);
+
+    // The asker's own user's typed pick decides it.
+    const ok = await answer(s.id, t.id, cid, owner, "merge");
+    expect(ok.status).toBe(200);
+    const actorViewer: CommentViewer = {
+      userId: owner.userId,
+      short: null,
+      agent: {
+        name: "Actor",
+        version: null,
+        identity: {
+          identityId: "id-ns-owner-Actor",
+          namespace: "ns-owner",
+          name: "Actor",
+          kind: "x",
+        },
+      },
+    };
+    const seen = await listComments(E, s.id, "all", actorViewer);
+    expect(seen.threads[0]?.comments[0]?.ask?.answer?.yes).toBe(true);
+    expect(seen.threads[0]?.comments[0]?.ask?.subject).toBe(
+      "outcomeeng/open-artifacts@42f8c7b",
+    );
+  });
+
+  it("delivers the answered notice to the agent named in for (with subject) and to no other agent of the member", async () => {
+    const s = await setup();
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-ActorB",
+      namespace: "ns-owner",
+      name: "ActorB",
+    });
+    hubs.set({
+      owner: owner.userId,
+      identityId: "id-ns-owner-Bystander",
+      namespace: "ns-owner",
+      name: "Bystander",
+    });
+    await follow(
+      E,
+      owner.userId,
+      { namespace: "ns-owner", name: "ActorB" },
+      s.id,
+    );
+    await follow(
+      E,
+      owner.userId,
+      { namespace: "ns-owner", name: "Bystander" },
+      s.id,
+    );
+    const list = (await (
+      await api(app, R.artifactAgents(s.id), owner.cookie)
+    ).json()) as ArtifactAgent[];
+    const actorBKey = list.find((a) => a.name === "ActorB")?.key as string;
+    expect(actorBKey).toBeDefined();
+
+    const art = { id: s.id, format: "html", currentVersion: 1 } as never;
+    const subject = "Change #1117 rev 3";
+    const t = await addThread(
+      E,
+      art,
+      agentOf(owner, "Claude", "ns-owner"),
+      view(owner),
+      {
+        anchor: NOTE,
+        body: "Approve?",
+        ask: {
+          question: "Ship Change #1117?",
+          options: OPTS,
+          to: [{ key: owner.userId }],
+          for: [{ key: actorBKey }],
+          subject,
+        },
+      },
+      { moderator: true },
+    );
+    const cid = (t.comments[0] as Comment).id;
+    bus.clear();
+
+    const r = await answer(s.id, t.id, cid, owner, "wide");
+    expect(r.status).toBe(200);
+
+    const sent = answered();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.notice.to).toEqual({
+      namespace: "ns-owner",
+      name: "ActorB",
+    });
+    expect(sent[0]?.notice.toIdentity).toBe("id-ns-owner-ActorB");
+    expect(sent[0]?.notice.text).toContain(`Subject: ${subject}`);
+    expect(sent.map((x) => x.notice.to.name)).not.toContain("Claude");
+    expect(sent.map((x) => x.notice.to.name)).not.toContain("Bystander");
   });
 });

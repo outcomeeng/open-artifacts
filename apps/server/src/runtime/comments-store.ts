@@ -33,7 +33,8 @@ create index if not exists comments_thread on comments (thread_id, created_at);
 create table if not exists comment_asks (
   comment_id text primary key, thread_id text not null, question text not null,
   options text not null, recommended text, addressees text not null, answer text,
-  confirm text, decider text, replaces text, withdrawn text
+  confirm text, decider text, replaces text, withdrawn text,
+  for_agents text, subject text
 );
 create index if not exists comment_asks_thread on comment_asks (thread_id);
 create table if not exists comment_ask_picks (
@@ -135,11 +136,20 @@ export type StoredPick = {
   decision?: true;
 };
 
+/** outcomeeng: an agent named in `ask.for`, with the bus namespace and identity resolved at post time. */
+export type StoredForAgent = Extract<StoredParty, { kind: "agent" }> & {
+  namespace?: string;
+};
+
 export type StoredAsk = {
   question: string;
   options: AskOption[];
   recommended?: { optionId: string; why: string };
   to: StoredParty[];
+  /** outcomeeng: agents that act on this ask's answer, fixed to their identity at post time; immutable. */
+  for?: StoredForAgent[];
+  /** outcomeeng: exact target approved by this ask (1 to 200 characters); immutable. */
+  subject?: string;
   answer?: {
     optionId: string;
     /** #2895: the decision is the decider's own words (optionId is ""). */
@@ -402,7 +412,8 @@ export function listThreads(
   if (cand.length > 0)
     for (const r of sql.exec<{ thread_id: string; b: number }>(
       `select thread_id, sum(length(question) + length(options) + length(addressees)
-         + length(coalesce(recommended, '')) + length(coalesce(answer, ''))) as b
+         + length(coalesce(recommended, '')) + length(coalesce(answer, ''))
+         + length(coalesce(for_agents, '')) + length(coalesce(subject, ''))) as b
        from comment_asks where thread_id in (select value from json_each(?)) group by thread_id`,
       JSON.stringify(cand.map((t) => t.id)),
     )) {
@@ -461,6 +472,8 @@ type AskRow = {
   options: string;
   recommended: string | null;
   addressees: string;
+  for_agents: string | null;
+  subject: string | null;
   answer: string | null;
   confirm: string | null;
   decider: string | null;
@@ -528,6 +541,10 @@ const askOf = (r: AskRow): StoredAsk => ({
       }
     : {}),
   to: JSON.parse(r.addressees) as StoredParty[],
+  ...(r.for_agents
+    ? { for: JSON.parse(r.for_agents) as StoredForAgent[] }
+    : {}),
+  ...(r.subject ? { subject: r.subject } : {}),
   ...(r.decider ? { decider: r.decider } : {}),
   ...(r.replaces ? { replaces: r.replaces } : {}),
   ...(r.withdrawn
@@ -553,7 +570,7 @@ function attachExtras(
   const ids = JSON.stringify(threadIds);
   const byId = new Map(comments.map((c) => [c.id, c]));
   for (const r of sql.exec<AskRow>(
-    `select a.comment_id, a.question, a.options, a.recommended, a.addressees, a.answer, a.confirm, a.decider, a.replaces, a.withdrawn, t.status
+    `select a.comment_id, a.question, a.options, a.recommended, a.addressees, a.for_agents, a.subject, a.answer, a.confirm, a.decider, a.replaces, a.withdrawn, t.status
      from comment_asks a join comment_threads t on t.id = a.thread_id
      where a.thread_id in (select value from json_each(?))`,
     ids,
@@ -788,8 +805,8 @@ export function insertExtras(
   if (x.ask?.replaces) checkReplaces(sql, commentId, x.ask.replaces);
   if (x.ask)
     sql.exec(
-      `insert into comment_asks (comment_id, thread_id, question, options, recommended, addressees, confirm, decider, replaces)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `insert into comment_asks (comment_id, thread_id, question, options, recommended, addressees, confirm, decider, replaces, for_agents, subject)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       commentId,
       threadId,
       x.ask.question,
@@ -799,6 +816,8 @@ export function insertExtras(
       x.ask.confirm === "passkey" ? "passkey" : null,
       x.ask.decider ?? null,
       x.ask.replaces ?? null,
+      x.ask.for?.length ? JSON.stringify(x.ask.for) : null,
+      x.ask.subject ?? null,
     );
   const put = (kind: "mention" | "asker" | "asked", p: StoredAgent) =>
     sql.exec(
@@ -954,8 +973,14 @@ export function heldContent(
     .toArray()[0];
   if (!c) return null;
   const ask = sql
-    .exec<{ question: string; options: string; recommended: string | null }>(
-      "select question, options, recommended from comment_asks where comment_id = ?",
+    .exec<{
+      question: string;
+      options: string;
+      recommended: string | null;
+      for_agents: string | null;
+      subject: string | null;
+    }>(
+      "select question, options, recommended, for_agents, subject from comment_asks where comment_id = ?",
       commentId,
     )
     .toArray()[0];
@@ -1716,7 +1741,7 @@ export function askRow(
 ): { ask: StoredAsk; status: string; author: string; legacy: boolean } | null {
   const r = sql
     .exec<AskRow & { status: string; author: string }>(
-      `select a.comment_id, a.question, a.options, a.recommended, a.addressees, a.answer, a.confirm, a.decider, a.replaces, a.withdrawn, t.status, c.author
+      `select a.comment_id, a.question, a.options, a.recommended, a.addressees, a.for_agents, a.subject, a.answer, a.confirm, a.decider, a.replaces, a.withdrawn, t.status, c.author
        from comment_asks a join comment_threads t on t.id = a.thread_id join comments c on c.id = a.comment_id
        where a.comment_id = ? and a.thread_id = ?`,
       commentId,

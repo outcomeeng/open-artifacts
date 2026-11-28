@@ -1022,6 +1022,29 @@ export function AskBlock({
               </span>
             </div>
           )}
+          {ask.for && ask.for.length > 0 && (
+            <p
+              data-ask-for=""
+              className={`flex flex-wrap items-center gap-x-2 gap-y-1 ${TXT} ${MUTED}`}
+            >
+              For
+              {ask.for.map((a, i) => (
+                <span
+                  key={a.id ?? `${a.name}-${i}`}
+                  className="inline-flex items-center gap-1 font-medium text-foreground"
+                >
+                  {a.linked !== undefined && <PartyFace p={a} />}
+                  {a.name}
+                </span>
+              ))}
+            </p>
+          )}
+          {ask.subject && (
+            <p data-ask-subject="" className={`${TXT} ${MUTED} break-words`}>
+              Subject:{" "}
+              <span className="font-medium text-foreground">{ask.subject}</span>
+            </p>
+          )}
           <Fold on={ownDecided} n={ask.options.length}>
             <ul
               ref={opts}
