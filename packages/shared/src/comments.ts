@@ -76,6 +76,8 @@ export const OWN_WORDS_OPTION_ID = "other";
 /** #2895: an answer in the person's own words is 1 to 1,000 characters after trimming. */
 export const OWN_WORDS_MAX = 1000;
 export const ASK_TO_MAX = 10;
+export const ASK_FOR_MAX = ASK_TO_MAX;
+export const ASK_SUBJECT_MAX = 200;
 export const MENTIONS_MAX = 10;
 
 const key = z.string().regex(COMMENT_KEY_RE);
@@ -166,6 +168,10 @@ export const CommentAskSchema = z
     options: askOptions,
     recommended: askRecommended,
     to: z.array(CommentAuthorSchema),
+    /** outcomeeng: agents that act on this ask's answer, shown as parties like `to`. */
+    for: z.array(CommentAuthorSchema).optional(),
+    /** outcomeeng: exact target approved by this ask (1 to 200 characters). */
+    subject: z.string().min(1).max(ASK_SUBJECT_MAX).optional(),
     /** #2381: who decides. Absent on a client built before it: read the asker's own user. */
     decider: CommentAuthorSchema.optional(),
     /** #2381: set when the asker named someone other than its own user as decider: the asker, as an author. */
@@ -493,6 +499,10 @@ export const AskInputSchema = z
     ),
     recommended: askRecommended,
     to: z.array(KeyRefSchema).min(1).max(ASK_TO_MAX),
+    /** outcomeeng: agents of the asker's own user that act on the answer (1 to 10 roster keys). */
+    for: z.array(KeyRefSchema).min(1).max(ASK_FOR_MAX).optional(),
+    /** outcomeeng: exact target approved by this ask (trimmed, 1 to 200 characters; required when `for` is set). */
+    subject: z.string().trim().min(1).max(ASK_SUBJECT_MAX).optional(),
     /** #2381: a person (member who can edit the page) who decides. Default: the asker's own user. Never on an ask that names an action. */
     decider: KeyRefSchema.optional(),
     /**
@@ -503,7 +513,11 @@ export const AskInputSchema = z
      */
     replaces: z.union([key, ReplacesRefSchema]).optional(),
   })
-  .refine(recommendedIsAnOption, recommendedMsg);
+  .refine(recommendedIsAnOption, recommendedMsg)
+  .refine((a) => a.for === undefined || a.subject !== undefined, {
+    message: "subject is required when for is set",
+    path: ["subject"],
+  });
 export type AskInput = z.infer<typeof AskInputSchema>;
 
 /** Shared by NewThreadBody and ReplyBody (no ask: MCP-only in v1). mentions: owner and editors only (403 forbidden). */

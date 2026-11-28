@@ -465,12 +465,18 @@ export function commentNoticeText(
   ownWords?: string,
   /** #3139: the comment your user typed (a mention, reply or question), so the agent needs no read. */
   typedText?: string,
+  /** outcomeeng: exact target approved by a delegated ask (`ask.subject`). */
+  subject?: string,
 ): string {
   const both =
     ids?.threadId && ids.commentId && isId(ids.threadId) && isId(ids.commentId);
   const idLine = both
     ? [`Thread ${ids.threadId}, comment ${ids.commentId}.`]
     : [];
+  const subjectLine =
+    kind === "answered" && subject !== undefined
+      ? [`Subject: ${subject.replace(/[\r\n]+/g, " ")}`]
+      : [];
   const hasTypedWords =
     fromYourUser && kind !== "answered" && typedText !== undefined;
   const typed = hasTypedWords
@@ -496,6 +502,7 @@ export function commentNoticeText(
     } (version ${version}).`,
     url,
     ...idLine,
+    ...subjectLine,
     ...typed,
     ...readLine,
     ...(fromYourUser && kind === "answered" && ownWords !== undefined
@@ -620,14 +627,16 @@ export async function notifyAnswered(
   threadId: string,
   commentId: string,
   askerId: string,
-  /** The asking agent's bus address; null sends nothing (#2224). */
-  asker: AskerAddress | null,
+  /** The asking agent's bus address, or the verified `for` agents' bus addresses; null/empty sends nothing (#2224). */
+  asker: AskerAddress | AskerAddress[] | null,
   /** The answer was picked in the web app by `askerId` themselves (#1797). */
   fromYourUser = false,
   /** Time the send may take; tests shrink it. */
   budgetMs = FANOUT_BUDGET_MS,
   /** #2895: the answer is the person's own words (their own user's, typed): sent in the text. */
   ownWords?: string,
+  /** outcomeeng: exact target approved by a delegated ask (`ask.subject`). */
+  subject?: string,
 ): Promise<void> {
   const targets = await askerAgents(env, artifactId, askerId, asker);
   if (targets.length === 0) return;
@@ -660,6 +669,8 @@ export async function notifyAnswered(
         { threadId, commentId, artifactId },
         fromYourUser,
         ownWords,
+        undefined,
+        subject,
       ),
       coalesceKey: `${artifactId}:${commentId}:answered`,
       notBefore: Date.now() + ANSWER_WINDOW_MS,
@@ -731,10 +742,11 @@ export async function askerAgents(
   env: Env,
   artifactId: string,
   askerId: string,
-  /** The asking agent's own bus address, or null: a person's ask, or an agent with no bus address (#2224). */
-  address: AskerAddress | null,
+  /** The asking agent's bus address (or verified `for` agents' addresses), or null: a person's ask, or an agent with no bus address (#2224). */
+  address: AskerAddress | AskerAddress[] | null,
 ): Promise<AskerAddress[]> {
-  if (!address) return [];
+  const list = Array.isArray(address) ? address : address ? [address] : [];
+  if (list.length === 0) return [];
   const user = await getUser(env, askerId);
   if (!user || !(await accessLevel(env, callerOf(user), artifactId))) {
     await stmt(env.DB, DROP_MEMBER_FOLLOWS).bind(askerId, artifactId).run();
@@ -746,5 +758,5 @@ export async function askerAgents(
     return [];
   }
   if (!canConnect(user)) return [];
-  return [address];
+  return list;
 }
